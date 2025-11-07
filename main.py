@@ -217,19 +217,19 @@ def invia_offerta():
     save_pubblicati(asin)
     mark_posted(asin)
 
-def _tick():
-    try:
+def run_if_in_fascia_oraria():
+    now = datetime.utcnow().time()  # usa l'orario UTC del server
+    start = datetime.strptime("07:00", "%H:%M").time()  # 09:00 IT = 07:00 UTC (in CEST)
+    end   = datetime.strptime("19:00", "%H:%M").time()  # 21:00 IT = 19:00 UTC (in CEST)
+    if start <= now <= end:
         invia_offerta()
-    except Exception:
-        pass
+    else:
+        print(f"⏸ Fuori fascia oraria ({now.strftime('%H:%M')} UTC), nessuna offerta pubblicata.")
 
 def start_scheduler():
     schedule.clear()
-    schedule.every().day.at("08:59").do(resetta_pubblicati)
-    schedule.every(14).minutes.do(_tick)
+    schedule.every().day.at("06:59").do(resetta_pubblicati)  # 08:59 IT ≈ 06:59 UTC (in CEST)
+    schedule.every(14).minutes.do(run_if_in_fascia_oraria)
     while True:
         schedule.run_pending()
         time.sleep(5)
-
-if __name__ == "__main__":
-    start_scheduler()

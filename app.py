@@ -1,24 +1,23 @@
-from flask import Flask, jsonify, request
+from flask import Flask
 import threading
-from main import start_scheduler, _tick
+from main import start_scheduler, invia_offerta
 
 app = Flask(__name__)
 
-# avvia lo scheduler una sola volta in background
+# Avvio lo scheduler in background
 threading.Thread(target=start_scheduler, daemon=True).start()
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return "OK"
 
-# /run accetta sia POST che GET per comodità di test dal browser
-@app.route("/run", methods=["POST", "GET"])
-def run():
+@app.get("/run")
+def run_now():
     try:
-        _tick()
-        return jsonify({"status": "forzato"})
+        invia_offerta()
+        return "✅ Offerta pubblicata"
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return f"❌ Errore: {e}"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)

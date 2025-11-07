@@ -31,7 +31,7 @@ MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
-KEYWORDS = ["Apple", "Android", "smarthome"]
+KEYWORDS = ["Apple", "Android", "tecnologia", "smarthome", "game", "accessori", "accessori iphone", "smart"]
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4

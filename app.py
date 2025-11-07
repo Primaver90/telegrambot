@@ -1,20 +1,15 @@
-# app.py
-import os
-from flask import Flask, jsonify
+from flask import Flask
 import threading
-import main
+from main import start_scheduler
 
 app = Flask(__name__)
 
-if os.environ.get("SCHEDULER_STARTED") != "1":
-    os.environ["SCHEDULER_STARTED"] = "1"
-    threading.Thread(target=main.start_scheduler, daemon=True).start()
+# Avvio bot in thread separato
+threading.Thread(target=start_scheduler, daemon=True).start()
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True})
+    return "OK"
 
-@app.post("/run")
-def run_now():
-    threading.Thread(target=main.invia_offerta, daemon=True).start()
-    return jsonify({"queued": True})
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)

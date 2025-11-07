@@ -1,153 +1,76 @@
 import os
-from telegram import Bot
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-from amazon_paapi import AmazonApi
-from PIL import Image, ImageDraw, ImageFont
-import requests
-
-def _autocrop_nonblack(im, tol=12):
-    if im.mode != "RGB":
-        im = im.convert("RGB")
-    px = im.load()
-    w,h = im.size
-    top, bottom, left, right = 0, h-1, 0, w-1
-
-    # top
-    for y in range(h):
-        if any(px[x,y][0]>tol or px[x,y][1]>tol or px[x,y][2]>tol for x in range(w)):
-            top = y; break
-    # bottom
-    for y in range(h-1, -1, -1):
-        if any(px[x,y][0]>tol or px[x,y][1]>tol or px[x,y][2]>tol for x in range(w)):
-            bottom = y; break
-    # left
-    for x in range(w):
-        if any(px[x,y][0]>tol or px[x,y][1]>tol or px[x,y][2]>tol for y in range(h)):
-            left = x; break
-    # right
-    for x in range(w-1, -1, -1):
-        if any(px[x,y][0]>tol or px[x,y][1]>tol or px[x,y][2]>tol for y in range(h)):
-            right = x; break
-
-    if right<=left or bottom<=top:
-        return im
-    return im.crop((left, top, right+1, bottom+1))
-
-
-def _crop_bottom_black(im, tol=12):
-    if im.mode != "RGB":
-        im = im.convert("RGB")
-    px = im.load()
-    w, h = im.size
-    cut = h
-    for y in range(h-1, -1, -1):
-        row_ok = False
-        for x in range(w):
-            r,g,b = px[x,y]
-            if r>tol or g>tol or b>tol:
-                row_ok = True
-                break
-        if row_ok:
-            cut = y+1
-            break
-    return im.crop((0,0,w,cut))
-
-
-def _fmt_euro(x):
-    s = f"{x:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", ".")
-    return s
-def _wrap(draw, text, font, max_w):
-    words = text.split()
-    lines=[]; cur=""
-    for w in words:
-        test = (cur+" "+w).strip()
-        if draw.textlength(test, font=font) <= max_w or not cur:
-            cur = test
-        else:
-            lines.append(cur); cur=w
-    if cur: lines.append(cur)
-    return lines[:4]
-
 from io import BytesIO
-import schedule
+from datetime import datetime, timedelta
 import time
-from datetime import datetime
+import json
+import schedule
+import requests
+from PIL import Image, ImageDraw, ImageFont
+from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
+from amazon_paapi import AmazonApi
 
-def is_real_deal(offer):
-    try:
-        price = getattr(offer, "price", None)
-        savings = getattr(price, "savings", None)
-        perc = int(getattr(savings, "percentage", 0) or 0)
-        amount_save = float(getattr(savings, "amount", 0) or 0)
-        prime = bool(getattr(offer, "is_eligible_for_prime", False))
-        fulfilled = bool(getattr(getattr(offer, "delivery_info", None), "is_amazon_fulfilled", False))
-        merchant = (getattr(getattr(offer, "merchant_info", None), "name", "") or "").lower()
-        if perc < 15 or amount_save < 5:
-            return False
-        if not (prime or fulfilled):
-            return False
-        if merchant and "amazon" not in merchant:
-            return False
-        return True
-    except Exception:
-        return False
+AMAZON_ACCESS_KEY = os.environ.get("AKPAZS2VGY1748024339", "")
+AMAZON_SECRET_KEY = os.environ.get("yiA1TX0xWWVtW1HgKpkR2LWZpklQXaJ2k9D4HsiL", "")
+AMAZON_ASSOCIATE_TAG = os.environ.get("itech00-21", "")
+AMAZON_COUNTRY = os.environ.get("AMAZON_COUNTRY", "IT")
+TELEGRAM_BOT_TOKEN = os.environ.get("7687135950:AAHfRV6b4RgAcVU6j71wDfZS-1RTMJ15ajg", "")
+TELEGRAM_CHAT_ID = os.environ.get("1001010781022", "")
+
+FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
+LOGO_PATH = os.environ.get("LOGO_PATH", "deals cuts news copia.png")
+BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
+
+DATA_DIR = "/data"
+PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
+PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
+KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
+
+MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
+MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
+
+KEYWORDS = [
+    "Apple",
+    "Android",
+    "smarthome",
+]
+
+SEARCH_INDEX = "All"
+ITEMS_PER_PAGE = 8
+PAGES = 4
+
+os.makedirs(DATA_DIR, exist_ok=True)
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
     x, y = position
-    # Disegna più volte il testo attorno al punto centrale
     for dx in (-offset, 0, offset):
         for dy in (-offset, 0, offset):
             draw.text((x + dx, y + dy), text, font=font, fill=fill)
 
-# Chiavi di accesso Amazon e Telegram
-AMAZON_ACCESS_KEY = "AKPAZS2VGY1748024339"
-AMAZON_SECRET_KEY = "yiA1TX0xWWVtW1HgKpkR2LWZpklQXaJ2k9D4HsiL"
-AMAZON_ASSOCIATE_TAG = "itech00-21"
-AMAZON_COUNTRY = "IT"
-TELEGRAM_BOT_TOKEN = "7687135950:AAHfRV6b4RgAcVU6j71wDfZS-1RTMJ15ajg"
-TELEGRAM_CHAT_ID = "-1001010781022"
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
-
-font_path = "Montserrat-VariableFont_wght.ttf"
-logo_path = "header_clean2.png"
-badge_path = "minimo storico flat.png"
-
-def resetta_pubblicati():
-    with open("pubblicati.txt", "w") as f:
-        f.write("")
-    print("✅ File pubblicati.txt azzerato alle 8:59")
-schedule.every().day.at("08:59").do(resetta_pubblicati)
 def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_img, minimo_storico):
     img = Image.new("RGB", (1080, 1080), "white")
     draw = ImageDraw.Draw(img)
 
-    # Intestazione
-    logo = Image.open(logo_path).resize((1080, 165))
+    logo = Image.open(LOGO_PATH).resize((1080, 165))
     img.paste(logo, (0, 0))
 
-    # Badge minimo storico
     if minimo_storico and sconto >= 30:
-        badge = Image.open(badge_path).convert('RGBA')
-        badge.thumbnail((250, 250), Image.LANCZOS)
-        img.paste(badge, (60, 300), badge)
+        badge = Image.open(BADGE_PATH).resize((220, 96))
+        img.paste(badge, (24, 140), badge.convert("RGBA"))
 
-    # Percentuale sconto
-    font_perc = ImageFont.truetype(font_path, 88)
-    draw.text((850, 230), f"-{sconto}%", font=font_perc, fill="black")
+    font_perc = ImageFont.truetype(FONT_PATH, 88)
+    draw.text((830, 230), f"-{sconto}%", font=font_perc, fill="black")
 
-    # Immagine prodotto
-    response = requests.get(url_img, timeout=10)
+    response = requests.get(url_img, timeout=15)
     prodotto = Image.open(BytesIO(response.content)).resize((600, 600))
     img.paste(prodotto, (240, 230))
 
-    # Prezzi
-    font_old = ImageFont.truetype(font_path, 72)
-    font_new = ImageFont.truetype(font_path, 120)
-    prezzo_old_str = f"€ {prezzo_vecchio}"
-    prezzo_new_str = f"€ {prezzo_nuovo}"
+    font_old = ImageFont.truetype(FONT_PATH, 72)
+    font_new = ImageFont.truetype(FONT_PATH, 120)
+    prezzo_old_str = f"€ {prezzo_vecchio:.2f}"
+    prezzo_new_str = f"€ {prezzo_nuovo:.2f}"
 
     w_old = draw.textlength(prezzo_old_str, font=font_old)
     x_old = (1080 - int(w_old)) // 2
@@ -163,127 +86,182 @@ def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_im
     output.seek(0)
     return output
 
-def invia_offerta():
-    posted = False
-    print("🕵️ Cerco offerte tech su Amazon...")
-    try:
-        with open("pubblicati.txt", "r") as f:
-            pubblicati = {line.strip().upper() for line in f}
-    except FileNotFoundError:
-        pubblicati = set()
+def load_pubblicati():
+    if not os.path.exists(PUB_FILE):
+        return set()
+    with open(PUB_FILE, "r", encoding="utf-8") as f:
+        return {line.strip().upper() for line in f if line.strip()}
 
-    KEYWORDS = ["apple","android","home","smartwatch","monitor","tv","soundbar","ssd","gaming","router","echo","kindle"]
-    IDX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kw_idx.txt")
-    try:
-        with open(IDX_PATH, "r") as _f:
-            _kw_idx = int(_f.read().strip()) % len(KEYWORDS)
-    except Exception:
-        _kw_idx = 0
-    kw_order = KEYWORDS[_kw_idx:] + KEYWORDS[:_kw_idx]
-    for kw in kw_order:
-        time.sleep(1.2)
-        for page in range(1, 5):
-            print(f"chiamo PA-API '{kw}' pagina {page}")
-            risultati = amazon.search_items(keywords=kw, item_count=5, search_index="All", item_page=page)
-            print("ok", kw, page)
+def save_pubblicati(asin):
+    asin = (asin or "").strip().upper()
+    if not asin:
+        return
+    with open(PUB_FILE, "a", encoding="utf-8") as f:
+        f.write(asin + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
-            for item in risultati.items:
-                asin = getattr(item, 'asin', None)
-                if not asin:
-                    continue
-                asin = asin.strip().upper()
-                if asin in pubblicati:
-                    continue
-
-                titolo = item.item_info.title.display_value
-                titolo = titolo[:80].strip() + "…" if len(titolo) > 80 else titolo
-
-                offers = getattr(item, 'offers', None)
-                listings = getattr(offers, 'listings', []) if offers else []
-                offer = listings[0] if listings else None
-                if not offer:
-                    continue
-                if not is_real_deal(offer):
-                    continue
-
-                if not listings:
-                    continue
-
-                price = getattr(listings[0].price, 'amount', None)
-                savings = getattr(listings[0].price, 'savings', None)
-
-                if price is None:
-                    continue
-
-                prezzo_nuovo_valore = float(price)
-                prezzo_vecchio = prezzo_nuovo_valore + float(getattr(savings, 'amount', 0) or 0)
-                sconto = int(getattr(savings, 'percentage', 0) or 0)
-
-                if sconto < 5:
-                    continue
-
-                url_img = item.images.primary.large.url
-                url = item.detail_page_url
-                minimo = sconto >= 30
-
-                immagine = genera_immagine_offerta(titolo, prezzo_nuovo_valore, prezzo_vecchio, sconto, url_img, minimo)
-
-                caption = f"📌 *{titolo}*\n\n"
-                if minimo:
-                    caption += "❗️🚨 *MINIMO STORICO* 🚨❗️\n"
-                caption += f"💶 A soli *{prezzo_nuovo_valore:.2f}€* invece di *{prezzo_vecchio:.2f}€* (*-{sconto}%*)\n\n👉 [Acquista ora]({url})\n"
-
-                button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
-
-                bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=immagine, caption=caption, parse_mode="Markdown", reply_markup=button)
-
-                with open("pubblicati.txt", "a") as f:
-                    f.write(asin + "\n")
-
-                try:
-                    with open(IDX_PATH, "w") as _f:
-                        _f.write(str((_kw_idx + 1) % len(KEYWORDS)))
-                except Exception:
-                    pass
-                posted = True
-                return
-    if not posted:
-        print("Nessuna offerta idonea")
-
-
-invia_offerta()
-import schedule
-import time
-from datetime import datetime
-
-def is_real_deal(offer):
-    try:
-        price = getattr(offer, "price", None)
-        savings = getattr(price, "savings", None)
-        perc = int(getattr(savings, "percentage", 0) or 0)
-        amount_save = float(getattr(savings, "amount", 0) or 0)
-        prime = bool(getattr(offer, "is_eligible_for_prime", False))
-        fulfilled = bool(getattr(getattr(offer, "delivery_info", None), "is_amazon_fulfilled", False))
-        merchant = (getattr(getattr(offer, "merchant_info", None), "name", "") or "").lower()
-        if perc < 15 or amount_save < 5:
-            return False
-        if not (prime or fulfilled):
-            return False
-        if merchant and "amazon" not in merchant:
-            return False
+def can_post(asin, hours=24):
+    if not os.path.exists(PUB_TS):
         return True
-    except Exception:
-        return False
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+    with open(PUB_TS, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(";", 1)
+            if len(parts) != 2:
+                continue
+            a, ts = parts
+            if a == asin:
+                try:
+                    if datetime.fromisoformat(ts) > cutoff:
+                        return False
+                except:
+                    pass
+    return True
 
+def mark_posted(asin):
+    with open(PUB_TS, "a", encoding="utf-8") as f:
+        f.write(f"{asin};{datetime.utcnow().isoformat()}\n")
+        f.flush()
+        os.fsync(f.fileno())
 
-def run_if_in_fascia_oraria():
-    now = datetime.now().time()
-    if now >= datetime.strptime("09:00", "%H:%M").time() and now <= datetime.strptime("21:00", "%H:%M").time():
+def resetta_pubblicati():
+    open(PUB_FILE, "w", encoding="utf-8").close()
+    open(PUB_TS, "w", encoding="utf-8").close()
+
+def get_kw_index():
+    try:
+        with open(KW_INDEX, "r", encoding="utf-8") as f:
+            i = int(f.read().strip())
+    except:
+        i = 0
+    return i % len(KEYWORDS)
+
+def bump_kw_index():
+    i = get_kw_index()
+    i = (i + 1) % len(KEYWORDS)
+    with open(KW_INDEX, "w", encoding="utf-8") as f:
+        f.write(str(i))
+
+def pick_keyword():
+    i = get_kw_index()
+    kw = KEYWORDS[i]
+    bump_kw_index()
+    return kw
+
+def _first_valid_item_for_keyword(kw, pubblicati):
+    for page in range(1, PAGES + 1):
+        try:
+            results = amazon.search_items(
+                keywords=kw,
+                item_count=ITEMS_PER_PAGE,
+                search_index=SEARCH_INDEX,
+                item_page=page
+            )
+            items = getattr(results, "items", []) or []
+        except Exception:
+            items = []
+
+        for item in items:
+            asin = (getattr(item, "asin", None) or "").strip().upper()
+            if not asin or asin in pubblicati or not can_post(asin, hours=24):
+                continue
+
+            title = getattr(getattr(getattr(item, "item_info", None), "title", None), "display_value", "") or ""
+            title = " ".join(title.split())
+
+            listing = None
+            try:
+                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
+            except Exception:
+                listing = None
+            price_obj = getattr(listing, "price", None)
+            if not price_obj:
+                continue
+
+            try:
+                price_str = str(getattr(price_obj, "display_amount", "")).replace("\u20ac", "").replace("€", "").replace(",", ".").strip()
+                price_val = float(price_str)
+            except Exception:
+                continue
+
+            if price_val < MIN_PRICE or price_val > MAX_PRICE:
+                continue
+
+            savings = getattr(price_obj, "savings", None)
+            disc = int(getattr(savings, "percentage", 0) or 0)
+            old_val = price_val + float(getattr(savings, "amount", 0) or 0)
+
+            if disc < MIN_DISCOUNT:
+                continue
+
+            url_img = getattr(getattr(getattr(getattr(item, "images", None), "primary", None), "large", None), "url", None)
+            if not url_img:
+                url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+
+            url = getattr(item, "detail_page_url", None)
+            if not url and asin:
+                url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
+
+            minimo = disc >= 30
+            return {
+                "asin": asin,
+                "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
+                "price_new": price_val,
+                "price_old": old_val,
+                "discount": disc,
+                "url_img": url_img,
+                "url": url,
+                "minimo": minimo,
+            }
+    return None
+
+def invia_offerta():
+    pubblicati = load_pubblicati()
+    kw = pick_keyword()
+    payload = _first_valid_item_for_keyword(kw, pubblicati)
+    if not payload:
+        return
+
+    titolo = payload["title"]
+    prezzo_nuovo_val = payload["price_new"]
+    prezzo_vecchio_val = payload["price_old"]
+    sconto = payload["discount"]
+    url_img = payload["url_img"]
+    url = payload["url"]
+    minimo = payload["minimo"]
+    asin = payload["asin"]
+
+    immagine = genera_immagine_offerta(titolo, prezzo_nuovo_val, prezzo_vecchio_val, sconto, url_img, minimo)
+
+    caption = f"📌 *{titolo}*\n\n"
+    if minimo and sconto >= 30:
+        caption += "❗️🚨 *MINIMO STORICO* 🚨❗️\n"
+    caption += f"💶 A soli *{prezzo_nuovo_val:.2f}€* invece di *{prezzo_vecchio_val:.2f}€* (*-{sconto}%*)\n\n👉 [Acquista ora]({url})\n"
+
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
+
+    bot.send_photo(
+        chat_id=TELEGRAM_CHAT_ID,
+        photo=immagine,
+        caption=caption,
+        parse_mode="Markdown",
+        reply_markup=button
+    )
+
+    save_pubblicati(asin)
+    mark_posted(asin)
+
+def _tick():
+    try:
         invia_offerta()
+    except Exception:
+        pass
 
-# Ogni 14 minuti pubblica 1 offerta, solo se tra le 9:00 e le 21:00
-schedule.every(14).minutes.do(run_if_in_fascia_oraria)
-
-while True:
-    schedule.run_pending()
-    time.sleep(30)
+def start_scheduler():
+    schedule.clear()
+    schedule.every().day.at("08:59").do(resetta_pubblicati)
+    schedule.every(14).minutes.do(_tick)
+    while True:
+        schedule.run_pending()
+        time.sleep(5)

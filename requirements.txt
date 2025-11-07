@@ -1,7 +1,7 @@
-amazon-paapi
 python-telegram-bot==13.15
-Pillow
+python-amazon-paapi==5.0.1
+Pillow==10.4.0
+requests
 schedule
 Flask
 gunicorn
-requests

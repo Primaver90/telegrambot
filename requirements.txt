@@ -1,8 +1,7 @@
 python-telegram-bot==13.15
 python-amazon-paapi
-Pillow
-requests
-schedule
-Flask
-gunicorn
-waitress
+Pillow==10.4.0
+requests==2.32.3
+schedule==1.2.2
+Flask==3.0.3
+gunicorn==22.0.0

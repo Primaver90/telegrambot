@@ -228,7 +228,7 @@ def run_if_in_fascia_oraria():
 
 def start_scheduler():
     schedule.clear()
-    schedule.every().day.at("06:59").do(resetta_pubblicati)  # 08:59 IT ≈ 06:59 UTC (in CEST)
+    schedule.every().monday.at("06:59").do(resetta_pubblicati)  # 08:59 IT ≈ 06:59 UTC (in CEST)
     schedule.every(14).minutes.do(run_if_in_fascia_oraria)
     while True:
         schedule.run_pending()

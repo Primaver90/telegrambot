@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import time
 import schedule
 import requests
+import html
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
@@ -208,12 +209,31 @@ def invia_offerta():
     minimo = payload["minimo"]
     asin = payload["asin"]
     immagine = genera_immagine_offerta(titolo, prezzo_nuovo_val, prezzo_vecchio_val, sconto, url_img, minimo)
-    caption = f"📌 *{titolo}*\n\n"
+    safe_title = html.escape(titolo)
+    safe_url = html.escape(url, quote=True)
+
+    caption_parts = [
+        f"📌 <b>{safe_title}</b>",
+    ]
     if minimo and sconto >= 30:
-        caption += "❗️🚨 *MINIMO STORICO* 🚨❗️\n"
-    caption += f"💶 A soli *{prezzo_nuovo_val:.2f}€* invece di *{prezzo_vecchio_val:.2f}€* (*-{sconto}%*)\n\n👉 [Acquista ora]({url})\n"
+        caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
+
+    caption_parts.append(
+        f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
+        f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
+    )
+    caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
+
+    caption = "\n\n".join(caption_parts)
+
     button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
-    bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=immagine, caption=caption, parse_mode="Markdown", reply_markup=button)
+    bot.send_photo(
+        chat_id=TELEGRAM_CHAT_ID,
+        photo=immagine,
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=button,
+    )
     save_pubblicati(asin)
     mark_posted(asin)
 

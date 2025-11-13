@@ -32,7 +32,29 @@ MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
-KEYWORDS = ["Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch", "auricolari Bluetooth", "smart TV", "monitor PC", "notebook", "gaming mouse", "gaming tastiera", "console", "soundbar", "smart home", "aspirapolvere robot", "telecamere WiFi", "caricatore wireless", "accessori smartphone", "accessori iPhone"]
+KEYWORDS = [
+    "Apple",
+    "Android",
+    "iPhone",
+    "MacBook",
+    "tablet",
+    "smartwatch",
+    "auricolari Bluetooth",
+    "smart TV",
+    "monitor PC",
+    "notebook",
+    "gaming mouse",
+    "gaming tastiera",
+    "console",
+    "soundbar",
+    "smart home",
+    "aspirapolvere robot",
+    "telecamere WiFi",
+    "caricatore wireless",
+    "accessori smartphone",
+    "accessori iPhone",
+]
+
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
@@ -40,46 +62,59 @@ PAGES = 4
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
+
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
     x, y = position
     for dx in (-offset, 0, offset):
         for dy in (-offset, 0, offset):
             draw.text((x + dx, y + dy), text, font=font, fill=fill)
 
+
 def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_img, minimo_storico):
     img = Image.new("RGB", (1080, 1080), "white")
     draw = ImageDraw.Draw(img)
+
     logo = Image.open(LOGO_PATH).resize((1080, 165))
     img.paste(logo, (0, 0))
+
     if minimo_storico and sconto >= 30:
         badge = Image.open(BADGE_PATH).resize((220, 96))
         img.paste(badge, (24, 140), badge.convert("RGBA"))
+
     font_perc = ImageFont.truetype(FONT_PATH, 88)
     draw.text((830, 230), f"-{sconto}%", font=font_perc, fill="black")
+
     response = requests.get(url_img, timeout=15)
     prodotto = Image.open(BytesIO(response.content)).resize((600, 600))
     img.paste(prodotto, (240, 230))
+
     font_old = ImageFont.truetype(FONT_PATH, 72)
     font_new = ImageFont.truetype(FONT_PATH, 120)
+
     prezzo_old_str = f"€ {prezzo_vecchio:.2f}"
     prezzo_new_str = f"€ {prezzo_nuovo:.2f}"
+
     w_old = draw.textlength(prezzo_old_str, font=font_old)
     x_old = (1080 - int(w_old)) // 2
     draw_bold_text(draw, (x_old, 860), prezzo_old_str, font=font_old, fill="black", offset=1)
     draw.line((x_old - 10, 880, x_old + w_old + 10, 880), fill="black", width=10)
+
     w_new = draw.textlength(prezzo_new_str, font=font_new)
     x_new = (1080 - int(w_new)) // 2
     draw_bold_text(draw, (x_new, 910), prezzo_new_str, font=font_new, fill="darkred", offset=2)
+
     output = BytesIO()
     img.save(output, format="PNG")
     output.seek(0)
     return output
+
 
 def load_pubblicati():
     if not os.path.exists(PUB_FILE):
         return set()
     with open(PUB_FILE, "r", encoding="utf-8") as f:
         return {line.strip().upper() for line in f if line.strip()}
+
 
 def save_pubblicati(asin):
     asin = (asin or "").strip().upper()
@@ -89,6 +124,7 @@ def save_pubblicati(asin):
         f.write(asin + "\n")
         f.flush()
         os.fsync(f.fileno())
+
 
 def can_post(asin, hours=24):
     if not os.path.exists(PUB_TS):
@@ -108,15 +144,18 @@ def can_post(asin, hours=24):
                     pass
     return True
 
+
 def mark_posted(asin):
     with open(PUB_TS, "a", encoding="utf-8") as f:
         f.write(f"{asin};{datetime.utcnow().isoformat()}\n")
         f.flush()
         os.fsync(f.fileno())
 
+
 def resetta_pubblicati():
     open(PUB_FILE, "w", encoding="utf-8").close()
     open(PUB_TS, "w", encoding="utf-8").close()
+
 
 def get_kw_index():
     try:
@@ -126,17 +165,20 @@ def get_kw_index():
         i = 0
     return i % len(KEYWORDS)
 
+
 def bump_kw_index():
     i = get_kw_index()
     i = (i + 1) % len(KEYWORDS)
     with open(KW_INDEX, "w", encoding="utf-8") as f:
         f.write(str(i))
 
+
 def pick_keyword():
     i = get_kw_index()
     kw = KEYWORDS[i]
     bump_kw_index()
     return kw
+
 
 def _first_valid_item_for_keyword(kw, pubblicati):
     for page in range(1, PAGES + 1):
@@ -145,43 +187,77 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 keywords=kw,
                 item_count=ITEMS_PER_PAGE,
                 search_index=SEARCH_INDEX,
-                item_page=page
+                item_page=page,
             )
             items = getattr(results, "items", []) or []
         except Exception:
             items = []
+
         for item in items:
             asin = (getattr(item, "asin", None) or "").strip().upper()
             if not asin or asin in pubblicati or not can_post(asin, hours=24):
                 continue
-            title = getattr(getattr(getattr(item, "item_info", None), "title", None), "display_value", "") or ""
+
+            title = getattr(
+                getattr(getattr(item, "item_info", None), "title", None),
+                "display_value",
+                "",
+            ) or ""
             title = " ".join(title.split())
+
             try:
-                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
+                listing = getattr(
+                    getattr(item, "offers", None), "listings", [None]
+                )[0]
             except Exception:
                 listing = None
+
             price_obj = getattr(listing, "price", None)
             if not price_obj:
                 continue
+
             try:
-                price_str = str(getattr(price_obj, "display_amount", "")).replace("\u20ac", "").replace("€", "").replace(",", ".").strip()
+                price_str = (
+                    str(getattr(price_obj, "display_amount", ""))
+                    .replace("\u20ac", "")
+                    .replace("€", "")
+                    .replace(",", ".")
+                    .strip()
+                )
                 price_val = float(price_str)
             except Exception:
                 continue
+
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
                 continue
+
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
             old_val = price_val + float(getattr(savings, "amount", 0) or 0)
+
             if disc < MIN_DISCOUNT:
                 continue
-            url_img = getattr(getattr(getattr(getattr(item, "images", None), "primary", None), "large", None), "url", None)
+
+            url_img = getattr(
+                getattr(
+                    getattr(getattr(item, "images", None), "primary", None),
+                    "large",
+                    None,
+                ),
+                "url",
+                None,
+            )
             if not url_img:
-                url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+                url_img = (
+                    "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+                )
+
             url = getattr(item, "detail_page_url", None)
             if not url and asin:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
+
             minimo = disc >= 30
+
             return {
                 "asin": asin,
                 "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
@@ -192,7 +268,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 "url": url,
                 "minimo": minimo,
             }
+
     return None
+
 
 def invia_offerta():
     pubblicati = load_pubblicati()
@@ -200,6 +278,7 @@ def invia_offerta():
     payload = _first_valid_item_for_keyword(kw, pubblicati)
     if not payload:
         return
+
     titolo = payload["title"]
     prezzo_nuovo_val = payload["price_new"]
     prezzo_vecchio_val = payload["price_old"]
@@ -208,7 +287,16 @@ def invia_offerta():
     url = payload["url"]
     minimo = payload["minimo"]
     asin = payload["asin"]
-    immagine = genera_immagine_offerta(titolo, prezzo_nuovo_val, prezzo_vecchio_val, sconto, url_img, minimo)
+
+    immagine = genera_immagine_offerta(
+        titolo,
+        prezzo_nuovo_val,
+        prezzo_vecchio_val,
+        sconto,
+        url_img,
+        minimo,
+    )
+
     safe_title = html.escape(titolo)
     safe_url = html.escape(url, quote=True)
 
@@ -226,7 +314,10 @@ def invia_offerta():
 
     caption = "\n\n".join(caption_parts)
 
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
+    button = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛒 Acquista ora", url=url)]]
+    )
+
     bot.send_photo(
         chat_id=TELEGRAM_CHAT_ID,
         photo=immagine,
@@ -234,21 +325,40 @@ def invia_offerta():
         parse_mode="HTML",
         reply_markup=button,
     )
+
     save_pubblicati(asin)
     mark_posted(asin)
 
+
+def is_in_italy_window(now_utc=None):
+    if now_utc is None:
+        now_utc = datetime.utcnow()
+
+    month = now_utc.month
+    if 4 <= month <= 10:
+        offset_hours = 2  # CEST (circa aprile–ottobre)
+    else:
+        offset_hours = 1  # CET (circa novembre–marzo)
+
+    italy_time = now_utc + timedelta(hours=offset_hours)
+    in_window = 9 <= italy_time.hour < 21
+    return in_window, italy_time
+
+
 def run_if_in_fascia_oraria():
-    now = datetime.utcnow().time()  # usa l'orario UTC del server
-    start = datetime.strptime("07:00", "%H:%M").time()  # 09:00 IT = 07:00 UTC (in CEST)
-    end   = datetime.strptime("19:00", "%H:%M").time()  # 21:00 IT = 19:00 UTC (in CEST)
-    if start <= now <= end:
+    now_utc = datetime.utcnow()
+    in_window, italy_time = is_in_italy_window(now_utc)
+    if in_window:
         invia_offerta()
     else:
-        print(f"⏸ Fuori fascia oraria ({now.strftime('%H:%M')} UTC), nessuna offerta pubblicata.")
+        print(
+            f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata."
+        )
+
 
 def start_scheduler():
     schedule.clear()
-    schedule.every().monday.at("06:59").do(resetta_pubblicati)  # 08:59 IT ≈ 06:59 UTC (in CEST)
+    schedule.every().monday.at("06:59").do(resetta_pubblicati)
     schedule.every(14).minutes.do(run_if_in_fascia_oraria)
     while True:
         schedule.run_pending()

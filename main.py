@@ -9,6 +9,8 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from amazon_paapi import AmazonApi
+from flask import Flask
+import threading
 
 AMAZON_ACCESS_KEY = os.environ.get("AMAZON_ACCESS_KEY", "AKPAZS2VGY1748024339")
 AMAZON_SECRET_KEY = os.environ.get("AMAZON_SECRET_KEY", "yiA1TX0xWWVtW1HgKpkR2LWZpklQXaJ2k9D4HsiL")
@@ -59,8 +61,44 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
+# =========================
+# APP (per gunicorn app:app)
+# =========================
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "ok", 200
+
+# =========================
+# CLIENTS
+# =========================
+if TELEGRAM_BOT_TOKEN:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+else:
+    bot = None
+
+if AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY:
+    amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
+else:
+    amazon = None
+
+
+# =========================
+# UTILS
+# =========================
+def parse_eur_amount(display_amount: str):
+    """Parsa importi tipo '1.299,00 €' -> 1299.00"""
+    if not display_amount:
+        return None
+    s = str(display_amount)
+    s = s.replace("\u20ac", "").replace("€", "")
+    s = s.replace("\xa0", " ").strip()
+    s = s.replace(".", "").replace(",", ".").strip()
+    try:
+        return float(s)
+    except:
+        return None
 
 
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
@@ -178,7 +216,7 @@ def pick_keyword():
     kw = KEYWORDS[i]
     bump_kw_index()
     return kw
-    
+
 
 def _first_valid_item_for_keyword(kw, pubblicati):
     if amazon is None:
@@ -259,7 +297,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             }
 
     return None
-        
+
+
 def invia_offerta():
     if bot is None:
         print("❌ Bot Telegram non configurato (manca TELEGRAM_BOT_TOKEN).")

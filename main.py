@@ -544,3 +544,5 @@ def run_once():
 
 # Avvia scheduler in background quando Gunicorn importa il modulo
 start_scheduler_background()
+# Render/Gunicorn sta cercando main:start_scheduler: aliasiamo alla Flask app
+start_scheduler = app

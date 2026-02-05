@@ -8,6 +8,17 @@ app = Flask(__name__)
 threading.Thread(target=start_scheduler, daemon=True).start()
 
 @app.get("/health")
+from telegram import Bot
+
+@app.get("/ping")
+def ping():
+    try:
+        bot = Bot(token=os.environ.get("TELEGRAM_BOT_TOKEN"))
+        chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+        bot.send_message(chat_id=chat_id, text="✅ Ping OK: Telegram funziona")
+        return "OK"
+    except Exception as e:
+        return f"ERRORE: {e}"
 def health():
     return "OK"
 

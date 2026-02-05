@@ -196,6 +196,17 @@ def _first_valid_item_for_keyword(kw, pubblicati):
         for item in items:
             asin = (getattr(item, "asin", None) or "").strip().upper()
             if not asin or asin in pubblicati or not can_post(asin, hours=24):
+            if asin in pubblicati:
+                print("SKIP duplicato file:", asin)
+                continue
+            if not can_post(asin, hours=24):
+                print("SKIP duplicato 24h:", asin)
+                continue
+            if disc < MIN_DISCOUNT:
+                print("SKIP sconto basso:", asin, disc, kw)
+                continue
+            if price_val < MIN_PRICE or price_val > MAX_PRICE:
+                print("SKIP prezzo:", asin, price_val)
                 continue
 
             title = getattr(

@@ -28,7 +28,7 @@ PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
 PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
 KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 
-MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
+MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "5"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
@@ -57,7 +57,7 @@ KEYWORDS = [
 
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
-PAGES = 4
+PAGES = 8
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)

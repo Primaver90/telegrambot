@@ -59,8 +59,47 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
+
+# =========================
+# INIT
+# =========================
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("Manca TELEGRAM_BOT_TOKEN (env var)")
+
+if not TELEGRAM_CHAT_ID:
+    raise RuntimeError("Manca TELEGRAM_CHAT_ID (env var)")
+
+if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY:
+    raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY (env var)")
+
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
+
+
+# =========================
+# HELPERS
+# =========================
+def parse_eur_amount(display_amount: str):
+    """
+    Converte prezzi tipo:
+    - '€ 129,99' -> 129.99
+    - '1.299,00 €' -> 1299.00
+    - '1299,00' -> 1299.00
+    """
+    if not display_amount:
+        return None
+    s = str(display_amount)
+    s = s.replace("\u20ac", "").replace("€", "")
+    s = s.replace("\xa0", " ").strip()
+
+    # formato IT: separatore migliaia '.' e decimali ','
+    # esempio: 1.299,00 -> 1299.00
+    s = s.replace(".", "").replace(",", ".").strip()
+
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
@@ -180,7 +219,12 @@ def pick_keyword():
     return kw
 
 
+# =========================
+# CORE: SEARCH + FILTER
+# =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
+    reasons = Counter()
+
     for page in range(1, PAGES + 1):
         try:
             results = amazon.search_items(
@@ -192,11 +236,25 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             items = getattr(results, "items", []) or []
         except Exception as e:
             print(f"❌ ERRORE Amazon PA-API (kw='{kw}', page={page}): {repr(e)}")
+            reasons["paapi_error"] += 1
             items = []
+
+        if DEBUG_FILTERS:
+            print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
         for item in items:
             asin = (getattr(item, "asin", None) or "").strip().upper()
-            if not asin or asin in pubblicati or not can_post(asin, hours=24):
+            if not asin:
+                reasons["no_asin"] += 1
+                continue
+
+            # attenzione: pubblicati.txt blocca "per sempre" fino al reset
+            if asin in pubblicati:
+                reasons["dup_pub_file"] += 1
+                continue
+
+            if not can_post(asin, hours=24):
+                reasons["dup_24h"] += 1
                 continue
 
             title = getattr(
@@ -207,57 +265,68 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             title = " ".join(title.split())
 
             try:
-                listing = getattr(
-                    getattr(item, "offers", None), "listings", [None]
-                )[0]
+                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
             except Exception:
                 listing = None
+                reasons["no_listing"] += 1
+                continue
 
             price_obj = getattr(listing, "price", None)
             if not price_obj:
+                reasons["no_price_obj"] += 1
                 continue
 
-            try:
-                price_str = (
-                    str(getattr(price_obj, "display_amount", ""))
-                    .replace("\u20ac", "")
-                    .replace("€", "")
-                    .replace(",", ".")
-                    .strip()
-                )
-                price_val = float(price_str)
-            except Exception:
+            raw_amount = str(getattr(price_obj, "display_amount", ""))
+            price_val = parse_eur_amount(raw_amount)
+            if price_val is None:
+                reasons["bad_price_parse"] += 1
+                if DEBUG_FILTERS:
+                    print(f"[DEBUG] parse KO: display_amount='{raw_amount}'")
                 continue
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
+                reasons["price_out_range"] += 1
                 continue
 
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
-            old_val = price_val + float(getattr(savings, "amount", 0) or 0)
 
-            if disc < MIN_DISCOUNT:
-                continue
+            # prezzo vecchio: se savings manca, non inventiamo
+            old_val = price_val
+            try:
+                old_val = price_val + float(getattr(savings, "amount", 0) or 0)
+            except Exception:
+                old_val = price_val
+
+            # FILTRO SCONTO:
+            # - STRICT_DISCOUNT=1 -> comportamento originale (scarta anche se savings manca/percent=0)
+            # - STRICT_DISCOUNT=0 -> applica MIN_DISCOUNT solo se savings esiste davvero
+            if STRICT_DISCOUNT:
+                if disc < MIN_DISCOUNT:
+                    reasons["disc_too_low"] += 1
+                    continue
+            else:
+                if savings and disc < MIN_DISCOUNT:
+                    reasons["disc_too_low"] += 1
+                    continue
 
             url_img = getattr(
-                getattr(
-                    getattr(getattr(item, "images", None), "primary", None),
-                    "large",
-                    None,
-                ),
+                getattr(getattr(getattr(item, "images", None), "primary", None), "large", None),
                 "url",
                 None,
             )
             if not url_img:
-                url_img = (
-                    "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
-                )
+                reasons["no_img"] += 1
+                url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
             url = getattr(item, "detail_page_url", None)
             if not url and asin:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
 
             minimo = disc >= 30
+
+            if DEBUG_FILTERS:
+                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} savings={'Y' if savings else 'N'}")
 
             return {
                 "asin": asin,
@@ -270,12 +339,20 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 "minimo": minimo,
             }
 
+    if DEBUG_FILTERS:
+        print(f"[DEBUG] kw={kw} reasons={dict(reasons)}")
+
     return None
-        
+
+
+# =========================
+# SEND
+# =========================
 def invia_offerta():
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
+
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -301,23 +378,24 @@ def invia_offerta():
     safe_title = html.escape(titolo)
     safe_url = html.escape(url, quote=True)
 
-    caption_parts = [
-        f"📌 <b>{safe_title}</b>",
-    ]
+    caption_parts = [f"📌 <b>{safe_title}</b>"]
+
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
-    caption_parts.append(
-        f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
-        f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
-    )
-    caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
+    # Se disc==0 o old==new, evita testo brutto
+    if sconto > 0 and prezzo_vecchio_val > prezzo_nuovo_val:
+        caption_parts.append(
+            f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
+            f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
+        )
+    else:
+        caption_parts.append(f"💶 Prezzo attuale: <b>{prezzo_nuovo_val:.2f}€</b>")
 
+    caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
     caption = "\n\n".join(caption_parts)
 
-    button = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🛒 Acquista ora", url=url)]]
-    )
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
 
     bot.send_photo(
         chat_id=TELEGRAM_CHAT_ID,
@@ -332,16 +410,16 @@ def invia_offerta():
     print(f"✅ Pubblicata: {asin} | {kw}")
     return True
 
+
+# =========================
+# TIME WINDOW (Italy)
+# =========================
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
 
     month = now_utc.month
-    if 4 <= month <= 10:
-        offset_hours = 2  # CEST (circa aprile–ottobre)
-    else:
-        offset_hours = 1  # CET (circa novembre–marzo)
-
+    offset_hours = 2 if 4 <= month <= 10 else 1  # CET/CEST approx
     italy_time = now_utc + timedelta(hours=offset_hours)
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time
@@ -353,9 +431,7 @@ def run_if_in_fascia_oraria():
     if in_window:
         invia_offerta()
     else:
-        print(
-            f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata."
-        )
+        print(f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata.")
 
 
 def start_scheduler():
@@ -365,3 +441,8 @@ def start_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(5)
+
+
+if __name__ == "__main__":
+    print("🚀 Bot avviato")
+    start_scheduler()

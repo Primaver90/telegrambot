@@ -64,13 +64,6 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
-# Risorse per GetItems (fallback quando SearchItems non include offers/price)
-GETITEMS_RESOURCES = [
-    "ItemInfo.Title",
-    "Images.Primary.Large",
-    "Offers.Listings.Price",
-]
-
 
 # =========================
 # INIT
@@ -224,42 +217,70 @@ def pick_keyword():
     return kw
 
 
-def _get_item_with_price_by_asin(asin: str):
+def get_items_batch(asins):
     """
-    Fallback: quando SearchItems non include offers/price.
-    FIX: la tua amazon_paapi vuole un argomento posizionale "items" (lista ASIN).
+    CHIAVE: la tua libreria vuole get_items(items) dove items è LISTA ASIN POSIZIONALE.
+    Qui facciamo una sola chiamata per pagina (batch), così non bruci quota.
     """
-    if not asin:
-        return None
+    if not asins:
+        return {}
 
-    variants = [
-        lambda: amazon.get_items([asin], resources=GETITEMS_RESOURCES),          # items posizionale + resources
-        lambda: amazon.get_items(items=[asin], resources=GETITEMS_RESOURCES),    # items keyword + resources
-        lambda: amazon.get_items([asin]),                                        # items posizionale senza resources
-        lambda: amazon.get_items(items=[asin]),                                  # items keyword senza resources
-    ]
+    try:
+        # firma corretta per te: primo argomento posizionale = items
+        r = amazon.get_items(asins)
+        full_items = getattr(r, "items", None) or []
+        out = {}
+        for it in full_items:
+            a = (getattr(it, "asin", None) or "").strip().upper()
+            if a:
+                out[a] = it
+        return out
 
-    last_err = None
-    for fn in variants:
-        try:
-            r = fn()
-            items = getattr(r, "items", None) or []
-            return items[0] if items else None
-        except Exception as e:
-            last_err = e
-            if "TooManyRequests" in repr(e):
-                print(f"⏳ Rate limit su GetItems (asin={asin}). Stop fallback per ora.")
-                return None
+    except Exception as e:
+        msg = repr(e)
+        print(f"❌ GetItems batch fallito: {msg}")
 
-    print(f"❌ GetItems fallito asin={asin}: {repr(last_err)}")
-    return None
+        # se rate limit, fermiamoci subito
+        if "TooManyRequests" in msg:
+            print("⏳ Rate limit su GetItems batch: stop keyword e riprova più tardi.")
+        return {}
+
+
+def _extract_price_obj(item):
+    try:
+        listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
+    except Exception:
+        listing = None
+    return getattr(listing, "price", None) if listing else None
+
+
+def _extract_title(item):
+    title = getattr(
+        getattr(getattr(item, "item_info", None), "title", None),
+        "display_value",
+        "",
+    ) or ""
+    return " ".join(title.split())
+
+
+def _extract_image_url(item):
+    url_img = getattr(
+        getattr(
+            getattr(getattr(item, "images", None), "primary", None),
+            "large",
+            None,
+        ),
+        "url",
+        None,
+    )
+    return url_img
 
 
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
-        # SearchItems SENZA resources (evita MalformedRequest con la tua libreria)
+        # SearchItems SENZA resources (evita MalformedRequest)
         try:
             results = amazon.search_items(
                 keywords=kw,
@@ -272,11 +293,10 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             msg = repr(e)
             print(f"❌ ERRORE Amazon PA-API SearchItems (kw='{kw}', page={page}): {msg}")
 
-            # Se rate limit, non ha senso continuare pagine/keyword
             if "TooManyRequests" in msg:
                 reasons["rate_limited"] += 1
                 if DEBUG_FILTERS:
-                    print("[DEBUG] Rate limit: stop keyword e riprova al prossimo giro.")
+                    print("[DEBUG] Rate limit su SearchItems: stop keyword.")
                 return None
 
             reasons["paapi_error"] += 1
@@ -285,71 +305,52 @@ def _first_valid_item_for_keyword(kw, pubblicati):
         if DEBUG_FILTERS:
             print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
-        for item in items:
-            asin = (getattr(item, "asin", None) or "").strip().upper()
+        # Candidati (asin non duplicati)
+        candidates = []
+        for it in items:
+            asin = (getattr(it, "asin", None) or "").strip().upper()
             if not asin:
                 reasons["no_asin"] += 1
                 continue
-
             if asin in pubblicati:
                 reasons["dup_pub_file"] += 1
                 continue
-
             if not can_post(asin, hours=24):
                 reasons["dup_24h"] += 1
                 continue
+            candidates.append(asin)
 
-            # Titolo
-            title = getattr(
-                getattr(getattr(item, "item_info", None), "title", None),
-                "display_value",
-                "",
-            ) or ""
-            title = " ".join(title.split())
+        # Se SearchItems non porta price, facciamo un GetItems batch sui primi N candidati
+        # (una sola chiamata, non 30 chiamate)
+        full_map = get_items_batch(candidates[:GETITEMS_BATCH])
 
-            # Provo prezzo da SearchItems
-            listing = None
-            try:
-                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
-            except Exception:
-                listing = None
+        # Ora iteriamo gli items in ordine e proviamo a costruire un payload valido
+        for it in items:
+            asin = (getattr(it, "asin", None) or "").strip().upper()
+            if not asin or asin not in candidates:
+                continue
 
-            price_obj = getattr(listing, "price", None) if listing else None
+            title = _extract_title(it) or ""
+            price_obj = _extract_price_obj(it)
 
-            item_for_images = item
-
-            # Fallback GetItems se manca price_obj
+            # se manca price su search, prova full item
+            item_for_data = it
             if not price_obj:
                 reasons["no_price_obj"] += 1
-
-                full_item = _get_item_with_price_by_asin(asin)
-                if not full_item:
+                full = full_map.get(asin)
+                if not full:
                     reasons["getitems_failed"] += 1
                     continue
-
-                try:
-                    listing = getattr(getattr(full_item, "offers", None), "listings", [None])[0]
-                except Exception:
-                    listing = None
-
-                price_obj = getattr(listing, "price", None) if listing else None
+                item_for_data = full
+                price_obj = _extract_price_obj(full)
                 if not price_obj:
                     reasons["getitems_no_price"] += 1
                     continue
 
-                # Titolo migliore da GetItems
-                title2 = getattr(
-                    getattr(getattr(full_item, "item_info", None), "title", None),
-                    "display_value",
-                    "",
-                ) or ""
-                title2 = " ".join(title2.split())
+                title2 = _extract_title(full)
                 if title2:
                     title = title2
 
-                item_for_images = full_item
-
-            # Parsing prezzo robusto
             price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
             if price_val is None:
                 reasons["bad_price_parse"] += 1
@@ -359,7 +360,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["price_out_range"] += 1
                 continue
 
-            # Sconto / savings
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
 
@@ -374,38 +374,27 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     reasons["disc_too_low"] += 1
                     continue
             else:
-                # Se savings manca, non blocchiamo l’offerta
                 if savings and disc < MIN_DISCOUNT:
                     reasons["disc_too_low"] += 1
                     continue
 
-            # Immagine
-            url_img = getattr(
-                getattr(
-                    getattr(getattr(item_for_images, "images", None), "primary", None),
-                    "large",
-                    None,
-                ),
-                "url",
-                None,
-            )
+            url_img = _extract_image_url(item_for_data)
             if not url_img:
                 reasons["no_img"] += 1
                 url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
-            # URL
-            url = getattr(item, "detail_page_url", None)
+            url = getattr(it, "detail_page_url", None)
             if not url:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
 
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
-                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} (fallback={'Y' if item_for_images is not item else 'N'})")
+                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} (batch_full={'Y' if item_for_data is not it else 'N'})")
 
             return {
                 "asin": asin,
-                "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
+                "title": (title[:80].strip() + ("…" if len(title) > 80 else "")) if title else asin,
                 "price_new": price_val,
                 "price_old": old_val,
                 "discount": disc,
@@ -544,5 +533,6 @@ def run_once():
 
 # Avvia scheduler in background quando Gunicorn importa il modulo
 start_scheduler_background()
-# Render/Gunicorn sta cercando main:start_scheduler: aliasiamo alla Flask app
+
+# Alias: se Render avvia main:start_scheduler invece di main:app, non esplode
 start_scheduler = app

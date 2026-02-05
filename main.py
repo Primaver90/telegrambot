@@ -41,6 +41,9 @@ DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 # 1 = richiede sconto, 0 = (solo test) accetta anche prezzo senza sconto
 REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
+# prova resources su SearchItems; se MalformedRequest, fa retry senza
+USE_RESOURCES = os.environ.get("USE_RESOURCES", "1") == "1"
+
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "8"))
 PAGES = int(os.environ.get("PAGES", "4"))
@@ -59,8 +62,8 @@ KEYWORDS = [
 # =========================
 app = Flask(__name__)
 
-if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY:
-    raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY (env vars).")
+if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY or not AMAZON_ASSOCIATE_TAG:
+    raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY / AMAZON_ASSOCIATE_TAG (env vars).")
 
 amazon = AmazonApi(
     AMAZON_ACCESS_KEY,
@@ -70,6 +73,30 @@ amazon = AmazonApi(
 )
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+
+
+# =========================
+# DEBUG HELPERS
+# =========================
+def log_paapi_exception(prefix: str, e: Exception):
+    """
+    Stampa dettagli utili (senza segreti) perché MalformedRequest spesso nasconde info
+    in attributi del wrapper.
+    """
+    print(f"❌ {prefix}: {type(e).__name__} -> {repr(e)}")
+
+    # prova a estrarre campi comuni
+    for attr in ("message", "status_code", "status", "code", "errors", "response", "raw", "data"):
+        if hasattr(e, attr):
+            try:
+                val = getattr(e, attr)
+                # evita spam enorme
+                s = str(val)
+                if len(s) > 1200:
+                    s = s[:1200] + "...(troncato)"
+                print(f"[DEBUG] exception.{attr} = {s}")
+            except Exception:
+                pass
 
 
 # =========================
@@ -231,12 +258,6 @@ def _extract_image_url(item):
 
 
 def _extract_price_data(item):
-    """
-    Prova prezzo/savings da:
-    - offers.listings[0].price
-    - offers.summaries[0].lowest_price
-    - fallback varianti naming
-    """
     offers = getattr(item, "offers", None)
     if not offers:
         return (None, None)
@@ -276,43 +297,56 @@ def _extract_price_data(item):
 # =========================
 # CORE
 # =========================
-def _first_valid_item_for_keyword(kw, pubblicati):
-    reasons = Counter()
-
-    # Resources “best effort”: se la libreria li supporta, SearchItems tornerà già offers/price.
-    # Se NON li supporta, verranno ignorati o lanceranno TypeError -> gestito sotto.
-    resources = [
+def _search_items_safe(kw: str, page: int):
+    """
+    1) prova con resources (se abilitato)
+    2) se MalformedRequest, retry senza resources
+    """
+    # Resources conservativi: in molte implementazioni sono accettati
+    resources_safe = [
         "ItemInfo.Title",
         "Images.Primary.Large",
         "Offers.Listings.Price",
         "Offers.Listings.Savings",
-        "Offers.Summaries.LowestPrice",
-        "Offers.Summaries.Savings",
     ]
 
-    for page in range(1, PAGES + 1):
-        # --- SEARCH ITEMS ---
+    if USE_RESOURCES:
         try:
-            try:
-                results = amazon.search_items(
-                    keywords=kw,
-                    item_count=ITEMS_PER_PAGE,
-                    search_index=SEARCH_INDEX,
-                    item_page=page,
-                    resources=resources,
-                )
-            except TypeError:
-                # wrapper non supporta resources -> fallback
-                results = amazon.search_items(
-                    keywords=kw,
-                    item_count=ITEMS_PER_PAGE,
-                    search_index=SEARCH_INDEX,
-                    item_page=page,
-                )
+            return amazon.search_items(
+                keywords=kw,
+                item_count=ITEMS_PER_PAGE,
+                search_index=SEARCH_INDEX,
+                item_page=page,
+                resources=resources_safe,
+            )
+        except TypeError:
+            # wrapper non supporta resources param
+            pass
+        except Exception as e:
+            # se è MalformedRequest, facciamo retry senza resources
+            if type(e).__name__ == "MalformedRequest":
+                log_paapi_exception(f"SearchItems (con resources) kw='{kw}' page={page}", e)
+            else:
+                log_paapi_exception(f"SearchItems (con resources) kw='{kw}' page={page}", e)
 
+    # fallback senza resources
+    return amazon.search_items(
+        keywords=kw,
+        item_count=ITEMS_PER_PAGE,
+        search_index=SEARCH_INDEX,
+        item_page=page,
+    )
+
+
+def _first_valid_item_for_keyword(kw, pubblicati):
+    reasons = Counter()
+
+    for page in range(1, PAGES + 1):
+        try:
+            results = _search_items_safe(kw, page)
             items = getattr(results, "items", []) or []
         except Exception as e:
-            print(f"❌ ERRORE SearchItems (kw='{kw}', page={page}): {repr(e)}")
+            log_paapi_exception(f"SearchItems kw='{kw}' page={page}", e)
             reasons["paapi_error"] += 1
             items = []
 
@@ -502,7 +536,7 @@ def run_once():
         ok = invia_offerta()
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
-        print(f"❌ Errore /run: {repr(e)}")
+        log_paapi_exception("Errore /run", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

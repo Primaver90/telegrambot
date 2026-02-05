@@ -5,6 +5,7 @@ import time
 import schedule
 import requests
 import html
+from collections import Counter
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton

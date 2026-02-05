@@ -525,3 +525,5 @@ def run_once():
 
 # Avvia lo scheduler in background appena il modulo viene caricato da gunicorn
 start_scheduler_background()
+# Compatibilità: se Render/Gunicorn cerca "start_scheduler"
+start_scheduler = app

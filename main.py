@@ -80,11 +80,14 @@ app = Flask(__name__)
 if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY:
     raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY (env vars).")
 
-amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
+amazon = AmazonApi(
+    AMAZON_ACCESS_KEY,
+    AMAZON_SECRET_KEY,
+    AMAZON_ASSOCIATE_TAG,
+    AMAZON_COUNTRY,
+)
 
-bot = None
-if TELEGRAM_BOT_TOKEN:
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 
 # =========================
@@ -224,38 +227,39 @@ def pick_keyword():
 def _get_item_with_price_by_asin(asin: str):
     """
     Fallback: quando SearchItems non include offers/price.
-    Proviamo diverse firme perché amazon_paapi cambia tra versioni.
+    FIX: la tua amazon_paapi vuole un argomento posizionale "items" (lista ASIN).
     """
     if not asin:
         return None
 
-    # 1) get_items(item_ids=[...], resources=[...])
-    try:
-        r = amazon.get_items(item_ids=[asin], resources=GETITEMS_RESOURCES)
-        items = getattr(r, "items", None) or []
-        return items[0] if items else None
-    except Exception as e1:
-        # 2) get_items(item_ids=[...]) senza resources
+    variants = [
+        lambda: amazon.get_items([asin], resources=GETITEMS_RESOURCES),          # items posizionale + resources
+        lambda: amazon.get_items(items=[asin], resources=GETITEMS_RESOURCES),    # items keyword + resources
+        lambda: amazon.get_items([asin]),                                        # items posizionale senza resources
+        lambda: amazon.get_items(items=[asin]),                                  # items keyword senza resources
+    ]
+
+    last_err = None
+    for fn in variants:
         try:
-            r = amazon.get_items(item_ids=[asin])
+            r = fn()
             items = getattr(r, "items", None) or []
             return items[0] if items else None
-        except Exception as e2:
-            # 3) alcune versioni accettano asin singolo
-            try:
-                r = amazon.get_items(asin)
-                items = getattr(r, "items", None) or []
-                return items[0] if items else None
-            except Exception as e3:
-                print(f"❌ GetItems fallito asin={asin}: {repr(e1)} | {repr(e2)} | {repr(e3)}")
+        except Exception as e:
+            last_err = e
+            if "TooManyRequests" in repr(e):
+                print(f"⏳ Rate limit su GetItems (asin={asin}). Stop fallback per ora.")
                 return None
+
+    print(f"❌ GetItems fallito asin={asin}: {repr(last_err)}")
+    return None
 
 
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
-        # SearchItems "come prima" (senza resources) per evitare MalformedRequest()
+        # SearchItems SENZA resources (evita MalformedRequest con la tua libreria)
         try:
             results = amazon.search_items(
                 keywords=kw,
@@ -265,7 +269,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             )
             items = getattr(results, "items", []) or []
         except Exception as e:
-            print(f"❌ ERRORE Amazon PA-API SearchItems (kw='{kw}', page={page}): {repr(e)}")
+            msg = repr(e)
+            print(f"❌ ERRORE Amazon PA-API SearchItems (kw='{kw}', page={page}): {msg}")
+
+            # Se rate limit, non ha senso continuare pagine/keyword
+            if "TooManyRequests" in msg:
+                reasons["rate_limited"] += 1
+                if DEBUG_FILTERS:
+                    print("[DEBUG] Rate limit: stop keyword e riprova al prossimo giro.")
+                return None
+
             reasons["paapi_error"] += 1
             items = []
 
@@ -286,7 +299,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["dup_24h"] += 1
                 continue
 
-            # titolo
+            # Titolo
             title = getattr(
                 getattr(getattr(item, "item_info", None), "title", None),
                 "display_value",
@@ -294,7 +307,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             ) or ""
             title = " ".join(title.split())
 
-            # prova prezzo da SearchItems
+            # Provo prezzo da SearchItems
             listing = None
             try:
                 listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
@@ -303,8 +316,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
             price_obj = getattr(listing, "price", None) if listing else None
 
-            # fallback GetItems se manca price
             item_for_images = item
+
+            # Fallback GetItems se manca price_obj
             if not price_obj:
                 reasons["no_price_obj"] += 1
 
@@ -323,7 +337,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     reasons["getitems_no_price"] += 1
                     continue
 
-                # prendi titolo migliore se disponibile
+                # Titolo migliore da GetItems
                 title2 = getattr(
                     getattr(getattr(full_item, "item_info", None), "title", None),
                     "display_value",
@@ -335,7 +349,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
                 item_for_images = full_item
 
-            # parsing prezzo
+            # Parsing prezzo robusto
             price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
             if price_val is None:
                 reasons["bad_price_parse"] += 1
@@ -345,7 +359,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["price_out_range"] += 1
                 continue
 
-            # sconti
+            # Sconto / savings
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
 
@@ -360,11 +374,12 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     reasons["disc_too_low"] += 1
                     continue
             else:
+                # Se savings manca, non blocchiamo l’offerta
                 if savings and disc < MIN_DISCOUNT:
                     reasons["disc_too_low"] += 1
                     continue
 
-            # immagine
+            # Immagine
             url_img = getattr(
                 getattr(
                     getattr(getattr(item_for_images, "images", None), "primary", None),
@@ -378,7 +393,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["no_img"] += 1
                 url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
-            # url
+            # URL
             url = getattr(item, "detail_page_url", None)
             if not url:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
@@ -414,8 +429,8 @@ def invia_offerta():
 
     pubblicati = load_pubblicati()
     kw = pick_keyword()
-
     payload = _first_valid_item_for_keyword(kw, pubblicati)
+
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -445,7 +460,6 @@ def invia_offerta():
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
-    # se non abbiamo disc/old coerenti, evita testo brutto
     if sconto > 0 and prezzo_vecchio_val > prezzo_nuovo_val:
         caption_parts.append(
             f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
@@ -508,6 +522,11 @@ def start_scheduler_background():
 # =========================
 # FLASK ROUTES
 # =========================
+@app.route("/", methods=["GET"])
+def home():
+    return ("ok", 200)
+
+
 @app.route("/health", methods=["GET", "HEAD"])
 def health():
     return ("ok", 200)
@@ -523,7 +542,5 @@ def run_once():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# Avvia lo scheduler in background appena il modulo viene caricato da gunicorn
+# Avvia scheduler in background quando Gunicorn importa il modulo
 start_scheduler_background()
-# Compatibilità: se Render/Gunicorn cerca "start_scheduler"
-start_scheduler = app

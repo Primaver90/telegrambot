@@ -190,7 +190,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 item_page=page,
             )
             items = getattr(results, "items", []) or []
-        except Exception:
+        except Exception as e:
+            print(f"❌ ERRORE Amazon PA-API (kw='{kw}', page={page}): {repr(e)}")
             items = []
 
         for item in items:

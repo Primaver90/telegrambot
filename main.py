@@ -36,7 +36,7 @@ MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
-
+GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "10") or 10)
 KEYWORDS = [
     "Apple",
     "Android",

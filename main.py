@@ -7,6 +7,7 @@ import requests
 import html
 from collections import Counter
 from pathlib import Path
+from flask import Flask, jsonify
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from amazon_paapi import AmazonApi

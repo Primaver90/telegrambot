@@ -38,24 +38,19 @@ MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
 DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 
-# 1 = richiede sconto, 0 = (solo test) accetta anche prezzo senza sconto
+# 1 = richiede sconto; 0 = per test accetta anche prezzo senza sconto (utile per capire se i prezzi arrivano)
 REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
-# Per test: metti PAGES=1 e GETITEMS_BATCH=3 per non triggerare rate limit
 SEARCH_INDEX = os.environ.get("SEARCH_INDEX", "All")
 ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "8"))
 PAGES = int(os.environ.get("PAGES", "4"))
+
+# Quanti ASIN max per batch (fallback GetItems). Tienilo basso per evitare rate limit.
 GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "5"))
 
-# Risorse necessarie per avere prezzi/offerte in GetItems
-GETITEMS_RESOURCES = [
-    "ItemInfo.Title",
-    "Images.Primary.Large",
-    "Offers.Listings.Price",
-    "Offers.Listings.Savings",
-    "Offers.Summaries.LowestPrice",
-    "Offers.Summaries.Savings",
-]
+# Throttle per /run manuale (anti-spam)
+MIN_SECONDS_BETWEEN_RUNS = int(os.environ.get("MIN_SECONDS_BETWEEN_RUNS", "25"))
+_last_run_ts = 0.0
 
 KEYWORDS = [
     "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
@@ -63,6 +58,16 @@ KEYWORDS = [
     "gaming mouse", "gaming tastiera", "console", "soundbar", "smart home",
     "aspirapolvere robot", "telecamere WiFi", "caricatore wireless",
     "accessori smartphone", "accessori iPhone",
+]
+
+# RISORSE: qui sta la magia. Se Amazon/libreria ha cambiato default, senza queste i prezzi spesso spariscono.
+PAAPI_RESOURCES = [
+    "ItemInfo.Title",
+    "Images.Primary.Large",
+    "Offers.Listings.Price",
+    "Offers.Listings.Savings",
+    "Offers.Summaries.LowestPrice",
+    "Offers.Summaries.Savings",
 ]
 
 
@@ -85,24 +90,10 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 
 # =========================
-# DEBUG HELPERS
+# HELPERS
 # =========================
 def log_exc(prefix: str, e: Exception):
     print(f"❌ {prefix}: {type(e).__name__} -> {repr(e)}")
-
-
-def _get(obj, *names, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        for n in names:
-            if n in obj:
-                return obj.get(n, default)
-        return default
-    for n in names:
-        if hasattr(obj, n):
-            return getattr(obj, n)
-    return default
 
 
 def parse_eur_amount(value):
@@ -114,11 +105,112 @@ def parse_eur_amount(value):
     s = str(value)
     s = s.replace("\u20ac", "").replace("€", "")
     s = s.replace("\xa0", " ").strip()
+    # attenzione: Amazon spesso usa "1.234,56"
     s = s.replace(".", "").replace(",", ".").strip()
     try:
         return float(s)
     except Exception:
         return None
+
+
+def _safe_attr(obj, name, default=None):
+    try:
+        return getattr(obj, name)
+    except Exception:
+        return default
+
+
+def _normalize_items_response(resp):
+    if resp is None:
+        return []
+    if isinstance(resp, list):
+        return resp
+    if hasattr(resp, "items"):
+        return getattr(resp, "items") or []
+    if isinstance(resp, dict) and "items" in resp:
+        return resp.get("items") or []
+    return []
+
+
+def _extract_title(item):
+    try:
+        t = item.item_info.title.display_value
+        return " ".join(str(t).split())
+    except Exception:
+        return ""
+
+
+def _extract_image_url(item):
+    try:
+        return item.images.primary.large.url
+    except Exception:
+        return None
+
+
+def _extract_price_obj_and_savings(item):
+    """
+    Prova Listings[0].Price, altrimenti Summaries[0].LowestPrice
+    Ritorna (price_obj, savings_obj) oppure (None, None)
+    """
+    offers = _safe_attr(item, "offers", None)
+    if not offers:
+        return None, None
+
+    # listings
+    try:
+        listings = offers.listings or []
+        l0 = listings[0] if listings else None
+        if l0 and getattr(l0, "price", None):
+            price_obj = l0.price
+            savings_obj = getattr(price_obj, "savings", None)
+            return price_obj, savings_obj
+    except Exception:
+        pass
+
+    # summaries
+    try:
+        sums = offers.summaries or []
+        s0 = sums[0] if sums else None
+        if s0:
+            lowest = getattr(s0, "lowest_price", None) or getattr(s0, "lowestPrice", None)
+            if lowest:
+                savings_obj = getattr(s0, "savings", None)
+                return lowest, savings_obj
+    except Exception:
+        pass
+
+    return None, None
+
+
+def _price_value_from_priceobj(price_obj):
+    if not price_obj:
+        return None
+    disp = getattr(price_obj, "display_amount", None) or getattr(price_obj, "displayAmount", None)
+    v = parse_eur_amount(disp)
+    if v is not None:
+        return v
+    amt = getattr(price_obj, "amount", None) or getattr(price_obj, "value", None)
+    return parse_eur_amount(amt)
+
+
+def _discount_from_savings(savings_obj):
+    if not savings_obj:
+        return 0
+    perc = getattr(savings_obj, "percentage", 0) or 0
+    try:
+        return int(perc)
+    except Exception:
+        return 0
+
+
+def _old_price_from_savings(price_val, savings_obj):
+    if price_val is None:
+        return None
+    if not savings_obj:
+        return float(price_val)
+    amt = getattr(savings_obj, "amount", 0) or 0
+    extra = parse_eur_amount(amt)
+    return float(price_val) + float(extra or 0)
 
 
 # =========================
@@ -244,106 +336,53 @@ def pick_keyword():
 
 
 # =========================
-# AMAZON EXTRACTORS
+# AMAZON CALLS (LOW RATE)
 # =========================
-def _extract_title(item):
-    info = _get(item, "item_info", "itemInfo")
-    title = _get(info, "title", "Title")
-    t = _get(title, "display_value", "displayValue", default="") or ""
-    return " ".join(str(t).split())
-
-
-def _extract_image_url(item):
-    images = _get(item, "images", "Images")
-    primary = _get(images, "primary", "Primary")
-    large = _get(primary, "large", "Large")
-    return _get(large, "url", "URL")
-
-
-def _extract_price_data(item):
-    offers = _get(item, "offers", "Offers")
-    if not offers:
-        return (None, None)
-
-    listings = _get(offers, "listings", "Listings", default=[]) or []
-    listing0 = listings[0] if listings else None
-    if listing0 is not None:
-        price_obj = _get(listing0, "price", "Price")
-        savings_obj = _get(price_obj, "savings", "Savings")
-        if price_obj is not None:
-            return (price_obj, savings_obj)
-
-    summaries = _get(offers, "summaries", "Summaries", default=[]) or []
-    s0 = summaries[0] if summaries else None
-    if s0 is not None:
-        lowest = _get(s0, "lowest_price", "lowestPrice", "LowestPrice")
-        sv = _get(s0, "savings", "Savings")
-        if lowest is not None:
-            return (lowest, sv)
-
-    return (None, None)
-
-
-def _price_value_from_priceobj(price_obj):
-    display = _get(price_obj, "display_amount", "displayAmount")
-    v = parse_eur_amount(display)
-    if v is not None:
-        return v
-    amount = _get(price_obj, "amount", "Amount", "value", "Value")
-    return parse_eur_amount(amount)
-
-
-def _discount_from_savings(savings_obj):
-    if not savings_obj:
-        return 0
-    perc = _get(savings_obj, "percentage", "Percentage", default=0) or 0
+def search_items_with_resources(kw, page):
+    """
+    Prima prova con resources (per far arrivare i prezzi),
+    se il wrapper non lo supporta, fallback senza.
+    """
     try:
-        return int(perc)
-    except Exception:
-        return 0
-
-
-def _old_price_from_savings(price_val, savings_obj):
-    if not savings_obj:
-        return price_val
-    amt = _get(savings_obj, "amount", "Amount", default=0) or 0
-    extra = parse_eur_amount(amt)
-    return float(price_val) + float(extra or 0)
-
-
-def _normalize_items_response(resp):
-    if resp is None:
-        return []
-    if isinstance(resp, list):
-        return resp
-    if hasattr(resp, "items"):
-        it = getattr(resp, "items")
-        return it or []
-    if isinstance(resp, dict) and "items" in resp:
-        return resp.get("items") or []
-    return []
+        res = amazon.search_items(
+            keywords=kw,
+            item_count=ITEMS_PER_PAGE,
+            search_index=SEARCH_INDEX,
+            item_page=page,
+            resources=PAAPI_RESOURCES,
+        )
+        return res, "with_resources"
+    except TypeError as e:
+        # wrapper non accetta resources
+        if DEBUG_FILTERS:
+            print(f"[DEBUG] SearchItems resources non supportato: {repr(e)}")
+        res = amazon.search_items(
+            keywords=kw,
+            item_count=ITEMS_PER_PAGE,
+            search_index=SEARCH_INDEX,
+            item_page=page,
+        )
+        return res, "no_resources"
+    except Exception as e:
+        raise e
 
 
 def safe_get_items_batch(asins):
     """
-    IMPORTANTISSIMO: prima proviamo SEMPRE le chiamate con resources.
-    Non usiamo inspect.signature perché spesso il wrapper espone *args/**kwargs e ci frega.
+    Fallback: GetItems con resources se possibile.
+    Se rate limit, stop subito.
     """
     if not asins:
         return [], None
 
     fn = getattr(amazon, "get_items", None)
     if not fn:
-        print("❌ amazon.get_items non disponibile.")
-        return [], None
+        return [], "no_get_items"
 
-    # tentativi in ordine: con resources, senza, poi posizionale
     attempts = [
-        ("items+resources", lambda: fn(items=asins, resources=GETITEMS_RESOURCES)),
-        ("item_ids+resources", lambda: fn(item_ids=asins, resources=GETITEMS_RESOURCES)),
-        ("itemIds+resources", lambda: fn(itemIds=asins, resources=GETITEMS_RESOURCES)),
+        ("items+resources", lambda: fn(items=asins, resources=PAAPI_RESOURCES)),
+        ("item_ids+resources", lambda: fn(item_ids=asins, resources=PAAPI_RESOURCES)),
         ("items", lambda: fn(items=asins)),
-        ("item_ids", lambda: fn(item_ids=asins)),
         ("positional", lambda: fn(asins)),
     ]
 
@@ -359,14 +398,9 @@ def safe_get_items_batch(asins):
             last_err = e
             name = type(e).__name__
             if DEBUG_FILTERS:
-                print(f"[DEBUG] GetItems fallito ({kind}): {name} -> {repr(e)}")
-
-            # se rate limit: stop immediato
+                print(f"[DEBUG] GetItems fail ({kind}): {name} -> {repr(e)}")
             if name in ("TooManyRequests", "TooManyRequestsException"):
-                print("⏳ Rate limit su GetItems: stop batch e riprova più tardi.")
                 return [], "rate_limited"
-
-            # se malformed con resources: prova altri tentativi
             if name == "MalformedRequest":
                 continue
 
@@ -375,49 +409,85 @@ def safe_get_items_batch(asins):
     return [], "error"
 
 
-def _search_items_page(kw, page):
-    return amazon.search_items(
-        keywords=kw,
-        item_count=ITEMS_PER_PAGE,
-        search_index=SEARCH_INDEX,
-        item_page=page,
-    )
-
-
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
         try:
-            results = _search_items_page(kw, page)
+            results, mode = search_items_with_resources(kw, page)
             items = getattr(results, "items", []) or []
         except Exception as e:
             log_exc(f"SearchItems kw='{kw}' page={page}", e)
+            if type(e).__name__ in ("TooManyRequests", "TooManyRequestsException"):
+                reasons["rate_limited_search"] += 1
+                break
             reasons["paapi_error"] += 1
             items = []
+            mode = "error"
 
         if DEBUG_FILTERS:
-            print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
+            print(f"[DEBUG] kw={kw} page={page} items={len(items)} mode={mode}")
 
-        candidates = []
+        # 1) Prima prova a prendere prezzi direttamente da SearchItems (se resources hanno funzionato)
         for it in items:
             asin = (getattr(it, "asin", None) or "").strip().upper()
             if not asin:
                 reasons["no_asin"] += 1
                 continue
-            if asin in pubblicati:
-                reasons["dup_pub_file"] += 1
-                continue
-            if not can_post(asin, hours=24):
-                reasons["dup_24h"] += 1
+            if asin in pubblicati or not can_post(asin, hours=24):
+                reasons["dup"] += 1
                 continue
 
-            candidates.append({
+            title = _extract_title(it)
+            url_img = _extract_image_url(it) or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+            url = getattr(it, "detail_page_url", None) or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
+
+            price_obj, savings_obj = _extract_price_obj_and_savings(it)
+            if not price_obj:
+                reasons["no_price_in_searchitem"] += 1
+                continue
+
+            price_val = _price_value_from_priceobj(price_obj)
+            if price_val is None:
+                reasons["bad_price_parse"] += 1
+                continue
+
+            if price_val < MIN_PRICE or price_val > MAX_PRICE:
+                reasons["price_out_range"] += 1
+                continue
+
+            disc = _discount_from_savings(savings_obj)
+            old_val = _old_price_from_savings(price_val, savings_obj)
+
+            if REQUIRE_DISCOUNT and disc < MIN_DISCOUNT:
+                reasons["disc_too_low"] += 1
+                continue
+
+            minimo = disc >= 30
+
+            if DEBUG_FILTERS:
+                print(f"[DEBUG] ✅ scelto da SearchItems asin={asin} price={price_val} disc={disc}")
+
+            return {
                 "asin": asin,
-                "title": _extract_title(it),
-                "url_img": _extract_image_url(it),
-                "url": getattr(it, "detail_page_url", None) or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}",
-            })
+                "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
+                "price_new": price_val,
+                "price_old": old_val,
+                "discount": disc,
+                "url_img": url_img,
+                "url": url,
+                "minimo": minimo,
+            }
+
+        # 2) Se SearchItems non ha prezzi, fallback GetItems su un batch piccolo
+        candidates = []
+        for it in items:
+            asin = (getattr(it, "asin", None) or "").strip().upper()
+            if not asin:
+                continue
+            if asin in pubblicati or not can_post(asin, hours=24):
+                continue
+            candidates.append(it)
             if len(candidates) >= GETITEMS_BATCH:
                 break
 
@@ -425,12 +495,10 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             reasons["no_candidates"] += 1
             continue
 
-        asins = [c["asin"] for c in candidates]
+        asins = [(getattr(c, "asin", None) or "").strip().upper() for c in candidates]
         details, status = safe_get_items_batch(asins)
-
-        # se rate limit: stop tutto subito (non continuare pagine)
         if status == "rate_limited":
-            reasons["rate_limited"] += 1
+            reasons["rate_limited_getitems"] += 1
             break
 
         detail_by_asin = {}
@@ -440,16 +508,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 detail_by_asin[a] = d
 
         for c in candidates:
-            asin = c["asin"]
+            asin = (getattr(c, "asin", None) or "").strip().upper()
             det = detail_by_asin.get(asin)
             if not det:
                 reasons["getitems_empty_or_unmapped"] += 1
                 continue
 
-            price_obj, savings_obj = _extract_price_data(det)
+            price_obj, savings_obj = _extract_price_obj_and_savings(det)
             if not price_obj:
                 if DEBUG_FILTERS:
-                    has_offers = hasattr(det, "offers") or hasattr(det, "Offers")
+                    has_offers = hasattr(det, "offers")
                     print(f"[DEBUG] asin={asin} no_price_obj | has_offers={has_offers}")
                 reasons["no_price_obj"] += 1
                 continue
@@ -470,13 +538,13 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["disc_too_low"] += 1
                 continue
 
-            url_img = c["url_img"] or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
-            url = c["url"] or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
-            title = (c["title"] or asin).strip()
+            title = _extract_title(c)
+            url_img = _extract_image_url(c) or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+            url = getattr(c, "detail_page_url", None) or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
-                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc}")
+                print(f"[DEBUG] ✅ scelto da GetItems asin={asin} price={price_val} disc={disc}")
 
             return {
                 "asin": asin,
@@ -495,13 +563,26 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     return None
 
 
+# =========================
+# SEND OFFER
+# =========================
 def invia_offerta():
+    global _last_run_ts
+
     if bot is None:
         print("❌ TELEGRAM_BOT_TOKEN mancante.")
         return False
     if not TELEGRAM_CHAT_ID:
         print("❌ TELEGRAM_CHAT_ID mancante.")
         return False
+
+    # anti-spam /run
+    now = time.time()
+    if now - _last_run_ts < MIN_SECONDS_BETWEEN_RUNS:
+        wait = int(MIN_SECONDS_BETWEEN_RUNS - (now - _last_run_ts))
+        print(f"⏳ /run chiamato troppo presto. Attendi {wait}s.")
+        return False
+    _last_run_ts = now
 
     pubblicati = load_pubblicati()
     kw = pick_keyword()
@@ -553,6 +634,9 @@ def invia_offerta():
     return True
 
 
+# =========================
+# TIME WINDOW + SCHEDULER
+# =========================
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
@@ -608,4 +692,3 @@ def run_once():
 
 
 start_scheduler_background()
-start_scheduler = app

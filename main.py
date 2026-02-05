@@ -261,6 +261,10 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     return None
         
 def invia_offerta():
+    if bot is None:
+        print("❌ Bot Telegram non configurato (manca TELEGRAM_BOT_TOKEN).")
+        return False
+
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
@@ -289,9 +293,7 @@ def invia_offerta():
     safe_title = html.escape(titolo)
     safe_url = html.escape(url, quote=True)
 
-    caption_parts = [
-        f"📌 <b>{safe_title}</b>",
-    ]
+    caption_parts = [f"📌 <b>{safe_title}</b>"]
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
@@ -303,9 +305,7 @@ def invia_offerta():
 
     caption = "\n\n".join(caption_parts)
 
-    button = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🛒 Acquista ora", url=url)]]
-    )
+    button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
 
     bot.send_photo(
         chat_id=TELEGRAM_CHAT_ID,
@@ -320,16 +320,13 @@ def invia_offerta():
     print(f"✅ Pubblicata: {asin} | {kw}")
     return True
 
+
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
 
     month = now_utc.month
-    if 4 <= month <= 10:
-        offset_hours = 2  # CEST (circa aprile–ottobre)
-    else:
-        offset_hours = 1  # CET (circa novembre–marzo)
-
+    offset_hours = 2 if 4 <= month <= 10 else 1
     italy_time = now_utc + timedelta(hours=offset_hours)
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time
@@ -341,9 +338,7 @@ def run_if_in_fascia_oraria():
     if in_window:
         invia_offerta()
     else:
-        print(
-            f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata."
-        )
+        print(f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata.")
 
 
 def start_scheduler():
@@ -353,3 +348,20 @@ def start_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(5)
+
+
+# =========================
+# START SCHEDULER IN BACKGROUND
+# =========================
+_scheduler_started = False
+
+def ensure_scheduler_started():
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    _scheduler_started = True
+    t = threading.Thread(target=start_scheduler, daemon=True)
+    t.start()
+    print("✅ Scheduler avviato in background")
+
+ensure_scheduler_started()

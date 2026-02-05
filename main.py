@@ -32,6 +32,8 @@ KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
+DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
+STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
 
 KEYWORDS = [
     "Apple",
@@ -300,7 +302,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 old_val = price_val
 
             # FILTRO SCONTO:
-            # - STRICT_DISCOUNT=1 -> comportamento originale (scarta anche se savings manca/percent=0)
+            # - STRICT_DISCOUNT=0 -> comportamento originale (scarta anche se savings manca/percent=0)
             # - STRICT_DISCOUNT=0 -> applica MIN_DISCOUNT solo se savings esiste davvero
             if STRICT_DISCOUNT:
                 if disc < MIN_DISCOUNT:

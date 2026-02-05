@@ -328,7 +328,8 @@ def invia_offerta():
 
     save_pubblicati(asin)
     mark_posted(asin)
-
+    print(f"✅ Pubblicata: {asin} | {kw}")
+    return True
 
 def is_in_italy_window(now_utc=None):
     if now_utc is None:

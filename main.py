@@ -21,6 +21,7 @@ AMAZON_COUNTRY = os.environ.get("AMAZON_COUNTRY", "IT")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7687135950:AAHfRV6b4RgAcVU6j71wDfZS-1RTMJ15ajg")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1001010781022")
 
+
 FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
 LOGO_PATH = os.environ.get("LOGO_PATH", "header_clean2.png")
 BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
@@ -41,8 +42,8 @@ DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 # 1 = richiede sconto, 0 = (solo test) accetta anche prezzo senza sconto
 REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
-# prova resources su SearchItems; se MalformedRequest, fa retry senza
-USE_RESOURCES = os.environ.get("USE_RESOURCES", "1") == "1"
+# Quanti ASIN provare in GetItems per ogni giro (non esagerare: rate limit)
+GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "5"))
 
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "8"))
@@ -78,19 +79,12 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 # =========================
 # DEBUG HELPERS
 # =========================
-def log_paapi_exception(prefix: str, e: Exception):
-    """
-    Stampa dettagli utili (senza segreti) perché MalformedRequest spesso nasconde info
-    in attributi del wrapper.
-    """
+def log_exc(prefix: str, e: Exception):
     print(f"❌ {prefix}: {type(e).__name__} -> {repr(e)}")
-
-    # prova a estrarre campi comuni
     for attr in ("message", "status_code", "status", "code", "errors", "response", "raw", "data"):
         if hasattr(e, attr):
             try:
                 val = getattr(e, attr)
-                # evita spam enorme
                 s = str(val)
                 if len(s) > 1200:
                     s = s[:1200] + "...(troncato)"
@@ -295,41 +289,85 @@ def _extract_price_data(item):
 
 
 # =========================
-# CORE
+# GETITEMS (version-safe)
 # =========================
-def _search_items_safe(kw: str, page: int):
-    """
-    1) prova con resources (se abilitato)
-    2) se MalformedRequest, retry senza resources
-    """
-    # Resources conservativi: in molte implementazioni sono accettati
-    resources_safe = [
-        "ItemInfo.Title",
-        "Images.Primary.Large",
-        "Offers.Listings.Price",
-        "Offers.Listings.Savings",
-    ]
+def _normalize_items_response(resp):
+    if resp is None:
+        return []
+    if isinstance(resp, list):
+        return resp
+    if hasattr(resp, "items"):
+        it = getattr(resp, "items")
+        return it or []
+    if isinstance(resp, dict) and "items" in resp:
+        return resp.get("items") or []
+    return []
 
-    if USE_RESOURCES:
+
+def safe_get_items_batch(asins):
+    """
+    Chiama amazon.get_items in modo compatibile con diverse versioni della libreria.
+    Prova:
+    - get_items(item_ids=[...])
+    - get_items(items=[...])
+    - get_items([...]) (posizionale)
+    """
+    if not asins:
+        return []
+
+    fn = getattr(amazon, "get_items", None)
+    if not fn:
+        print("❌ amazon.get_items non disponibile nel wrapper.")
+        return []
+
+    sig = None
+    try:
+        sig = inspect.signature(fn)
+    except Exception:
+        sig = None
+
+    # Tentativi in ordine
+    attempts = []
+    if sig:
+        params = sig.parameters
+        if "item_ids" in params:
+            attempts.append(("item_ids", {"item_ids": asins}))
+        if "items" in params:
+            attempts.append(("items", {"items": asins}))
+
+    # fallback: prova posizionale
+    attempts.append(("positional", {"_pos": True}))
+
+    last_err = None
+    for kind, payload in attempts:
         try:
-            return amazon.search_items(
-                keywords=kw,
-                item_count=ITEMS_PER_PAGE,
-                search_index=SEARCH_INDEX,
-                item_page=page,
-                resources=resources_safe,
-            )
-        except TypeError:
-            # wrapper non supporta resources param
-            pass
-        except Exception as e:
-            # se è MalformedRequest, facciamo retry senza resources
-            if type(e).__name__ == "MalformedRequest":
-                log_paapi_exception(f"SearchItems (con resources) kw='{kw}' page={page}", e)
+            if payload.get("_pos"):
+                resp = fn(asins)
             else:
-                log_paapi_exception(f"SearchItems (con resources) kw='{kw}' page={page}", e)
+                resp = fn(**payload)
+            items = _normalize_items_response(resp)
+            if DEBUG_FILTERS:
+                print(f"[DEBUG] GetItems ok ({kind}). extracted_items={len(items)}")
+            return items
+        except Exception as e:
+            last_err = e
+            if DEBUG_FILTERS:
+                print(f"[DEBUG] GetItems fallito ({kind}): {type(e).__name__} -> {repr(e)}")
 
-    # fallback senza resources
+            # se rate limit, non insistere (evita ban)
+            if type(e).__name__ == "TooManyRequests":
+                print("⏳ Rate limit su GetItems: stop batch e riprova più tardi.")
+                break
+
+    if last_err:
+        log_exc("GetItems batch error", last_err)
+    return []
+
+
+# =========================
+# SEARCH + GETITEMS PIPELINE
+# =========================
+def _search_items_page(kw, page):
     return amazon.search_items(
         keywords=kw,
         item_count=ITEMS_PER_PAGE,
@@ -342,19 +380,22 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
+        # 1) SEARCH: prendiamo ASIN + title/img/url (no prezzi affidabili qui)
         try:
-            results = _search_items_safe(kw, page)
+            results = _search_items_page(kw, page)
             items = getattr(results, "items", []) or []
         except Exception as e:
-            log_paapi_exception(f"SearchItems kw='{kw}' page={page}", e)
+            log_exc(f"SearchItems kw='{kw}' page={page}", e)
             reasons["paapi_error"] += 1
             items = []
 
         if DEBUG_FILTERS:
             print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
-        for item in items:
-            asin = (getattr(item, "asin", None) or "").strip().upper()
+        # candidati da arricchire con GetItems
+        candidates = []
+        for it in items:
+            asin = (getattr(it, "asin", None) or "").strip().upper()
             if not asin:
                 reasons["no_asin"] += 1
                 continue
@@ -365,9 +406,40 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["dup_24h"] += 1
                 continue
 
-            title = _extract_title(item) or ""
-            price_obj, savings_obj = _extract_price_data(item)
+            candidates.append({
+                "asin": asin,
+                "title": _extract_title(it),
+                "url_img": _extract_image_url(it),
+                "url": getattr(it, "detail_page_url", None) or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}",
+            })
 
+            if len(candidates) >= GETITEMS_BATCH:
+                break
+
+        if not candidates:
+            reasons["no_candidates"] += 1
+            continue
+
+        # 2) GETITEMS: recuperiamo prezzi/offerte
+        asins = [c["asin"] for c in candidates]
+        details = safe_get_items_batch(asins)
+
+        # mapping asin->detail
+        detail_by_asin = {}
+        for d in details:
+            a = (getattr(d, "asin", None) or "").strip().upper()
+            if a:
+                detail_by_asin[a] = d
+
+        # 3) valuta ogni candidato in ordine
+        for c in candidates:
+            asin = c["asin"]
+            det = detail_by_asin.get(asin)
+            if not det:
+                reasons["getitems_empty_or_unmapped"] += 1
+                continue
+
+            price_obj, savings_obj = _extract_price_data(det)
             if not price_obj:
                 reasons["no_price_obj"] += 1
                 continue
@@ -393,12 +465,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["disc_too_low"] += 1
                 continue
 
-            url_img = _extract_image_url(item) or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
-
-            url = getattr(item, "detail_page_url", None)
-            if not url:
-                url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
-
+            url_img = c["url_img"] or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+            url = c["url"] or f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
+            title = (c["title"] or asin).strip()
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
@@ -406,7 +475,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
             return {
                 "asin": asin,
-                "title": (title[:80].strip() + ("…" if len(title) > 80 else "")) if title else asin,
+                "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
                 "price_new": price_val,
                 "price_old": old_val,
                 "discount": disc,
@@ -431,8 +500,8 @@ def invia_offerta():
 
     pubblicati = load_pubblicati()
     kw = pick_keyword()
-    payload = _first_valid_item_for_keyword(kw, pubblicati)
 
+    payload = _first_valid_item_for_keyword(kw, pubblicati)
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -536,7 +605,7 @@ def run_once():
         ok = invia_offerta()
         return jsonify({"ok": bool(ok)}), 200
     except Exception as e:
-        log_paapi_exception("Errore /run", e)
+        log_exc("Errore /run", e)
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

@@ -270,14 +270,14 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             }
 
     return None
-
-
+        
 def invia_offerta():
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
     if not payload:
-        return
+        print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
+        return False
 
     titolo = payload["title"]
     prezzo_nuovo_val = payload["price_new"]

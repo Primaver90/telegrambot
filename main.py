@@ -62,25 +62,19 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
-# >>> MODIFICA CHIAVE: forziamo PA-API a includere Offers/Price <<<
+# >>> FIX: RESOURCES MINIMI E VALIDI per SearchItems
+# Niente "Offers.Listings.Savings" perché non è un resource separato.
 RESOURCES = [
     "ItemInfo.Title",
     "Images.Primary.Large",
     "Offers.Listings.Price",
-    "Offers.Listings.Savings",
     "Offers.Listings.Availability.Message",
 ]
 
-# =========================
-# INIT CLIENTS
-# =========================
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
 
-# =========================
-# HELPERS
-# =========================
 def parse_eur_amount(display_amount: str):
     """Gestisce anche 1.299,00 € -> 1299.00"""
     if not display_amount:
@@ -212,9 +206,6 @@ def pick_keyword():
     return kw
 
 
-# =========================
-# CORE SEARCH
-# =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
@@ -225,7 +216,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 item_count=ITEMS_PER_PAGE,
                 search_index=SEARCH_INDEX,
                 item_page=page,
-                resources=RESOURCES,  # <<< MODIFICA CHIAVE
+                resources=RESOURCES,  # <<< FIX qui
             )
             items = getattr(results, "items", []) or []
         except Exception as e:
@@ -257,7 +248,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             ) or ""
             title = " ".join(title.split())
 
-            # >>> MODIFICA: separiamo "no_listings" da "no_price_obj"
             offers = getattr(item, "offers", None)
             listings = getattr(offers, "listings", None) or []
             if not listings:
@@ -346,6 +336,7 @@ def invia_offerta():
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
+
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -403,11 +394,7 @@ def is_in_italy_window(now_utc=None):
         now_utc = datetime.utcnow()
 
     month = now_utc.month
-    if 4 <= month <= 10:
-        offset_hours = 2  # CEST approx
-    else:
-        offset_hours = 1  # CET approx
-
+    offset_hours = 2 if 4 <= month <= 10 else 1
     italy_time = now_utc + timedelta(hours=offset_hours)
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time

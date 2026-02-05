@@ -178,9 +178,13 @@ def pick_keyword():
     kw = KEYWORDS[i]
     bump_kw_index()
     return kw
-
+    
 
 def _first_valid_item_for_keyword(kw, pubblicati):
+    if amazon is None:
+        print("❌ AmazonApi non configurata (mancano env vars).")
+        return None
+
     for page in range(1, PAGES + 1):
         try:
             results = amazon.search_items(
@@ -207,9 +211,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             title = " ".join(title.split())
 
             try:
-                listing = getattr(
-                    getattr(item, "offers", None), "listings", [None]
-                )[0]
+                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
             except Exception:
                 listing = None
 
@@ -217,27 +219,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             if not price_obj:
                 continue
 
-            
-def parse_eur_amount(display_amount: str):
-    if not display_amount:
-        return None
-    s = str(display_amount)
-    
-    s = s.replace("\u20ac", "").replace("€", "")
-    s = s.replace("\xa0", " ").strip()
-    
-    s = s.replace(".", "").replace(",", ".")
-    s = s.strip()
-
-    try:
-        return float(s)
-    except:
-        return None
-
-# ...
-price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
-if price_val is None:
-    continue    
+            price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
+            if price_val is None:
+                continue
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
                 continue
@@ -250,18 +234,12 @@ if price_val is None:
                 continue
 
             url_img = getattr(
-                getattr(
-                    getattr(getattr(item, "images", None), "primary", None),
-                    "large",
-                    None,
-                ),
+                getattr(getattr(getattr(item, "images", None), "primary", None), "large", None),
                 "url",
                 None,
             )
             if not url_img:
-                url_img = (
-                    "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
-                )
+                url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
             url = getattr(item, "detail_page_url", None)
             if not url and asin:

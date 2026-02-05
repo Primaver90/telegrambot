@@ -195,7 +195,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
         for item in items:
             asin = (getattr(item, "asin", None) or "").strip().upper()
-            if not asin or asin in pubblicati or not can_post(asin, hours=24):
+            if not asin:
+                print("SKIP asin vuoto")
+                continue
             if asin in pubblicati:
                 print("SKIP duplicato file:", asin)
                 continue

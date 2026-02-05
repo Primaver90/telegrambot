@@ -42,12 +42,22 @@ DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 # 1 = richiede sconto, 0 = (solo test) accetta anche prezzo senza sconto
 REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
-# Quanti ASIN provare in GetItems per ogni giro (non esagerare: rate limit)
+# Quanti ASIN provare in GetItems per ogni giro
 GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "5"))
 
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "8"))
 PAGES = int(os.environ.get("PAGES", "4"))
+
+# Risorse da chiedere ESPLICITAMENTE a GetItems per avere prezzi/sconti
+GETITEMS_RESOURCES = [
+    "ItemInfo.Title",
+    "Images.Primary.Large",
+    "Offers.Listings.Price",
+    "Offers.Listings.Savings",
+    "Offers.Summaries.LowestPrice",
+    "Offers.Summaries.Savings",
+]
 
 KEYWORDS = [
     "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
@@ -93,14 +103,37 @@ def log_exc(prefix: str, e: Exception):
                 pass
 
 
+def _get(obj, *names, default=None):
+    """Prende il primo attributo esistente tra i names (supporta anche dict)."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        for n in names:
+            if n in obj:
+                return obj.get(n, default)
+        return default
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return default
+
+
 # =========================
 # HELPERS
 # =========================
-def parse_eur_amount(display_amount: str):
-    """Supporta anche: 1.299,00 € -> 1299.00"""
-    if not display_amount:
+def parse_eur_amount(value):
+    """
+    Supporta:
+    - "1.299,00 €" -> 1299.00
+    - "1299.00" -> 1299.00
+    - numerico già float/int
+    """
+    if value is None:
         return None
-    s = str(display_amount)
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    s = str(value)
     s = s.replace("\u20ac", "").replace("€", "")
     s = s.replace("\xa0", " ").strip()
     s = s.replace(".", "").replace(",", ".").strip()
@@ -231,65 +264,77 @@ def pick_keyword():
 # AMAZON EXTRACTORS
 # =========================
 def _extract_title(item):
-    title = getattr(
-        getattr(getattr(item, "item_info", None), "title", None),
-        "display_value",
-        "",
-    ) or ""
-    return " ".join(title.split())
+    info = _get(item, "item_info", "itemInfo")
+    title = _get(info, "title", "Title")
+    return " ".join(str(_get(title, "display_value", "displayValue", default="") or "").split())
 
 
 def _extract_image_url(item):
-    return getattr(
-        getattr(
-            getattr(getattr(item, "images", None), "primary", None),
-            "large",
-            None,
-        ),
-        "url",
-        None,
-    )
+    images = _get(item, "images", "Images")
+    primary = _get(images, "primary", "Primary")
+    large = _get(primary, "large", "Large")
+    return _get(large, "url", "URL")
 
 
 def _extract_price_data(item):
-    offers = getattr(item, "offers", None)
+    offers = _get(item, "offers", "Offers")
     if not offers:
         return (None, None)
 
     # listings[0].price
-    try:
-        listings = getattr(offers, "listings", None) or []
-        listing0 = listings[0] if listings else None
-    except Exception:
-        listing0 = None
-
+    listings = _get(offers, "listings", "Listings", default=[]) or []
+    listing0 = listings[0] if listings else None
     if listing0 is not None:
-        price_obj = getattr(listing0, "price", None)
+        price_obj = _get(listing0, "price", "Price")
+        savings_obj = _get(price_obj, "savings", "Savings")
         if price_obj is not None:
-            return (price_obj, getattr(price_obj, "savings", None))
+            return (price_obj, savings_obj)
 
     # summaries[0].lowest_price
-    try:
-        summaries = getattr(offers, "summaries", None) or []
-        s0 = summaries[0] if summaries else None
-    except Exception:
-        s0 = None
-
+    summaries = _get(offers, "summaries", "Summaries", default=[]) or []
+    s0 = summaries[0] if summaries else None
     if s0 is not None:
-        lp = (
-            getattr(s0, "lowest_price", None)
-            or getattr(s0, "lowestPrice", None)
-            or getattr(s0, "lowestprice", None)
-        )
-        sv = getattr(s0, "savings", None)
-        if lp is not None:
-            return (lp, sv)
+        lowest = _get(s0, "lowest_price", "lowestPrice", "LowestPrice")
+        sv = _get(s0, "savings", "Savings")
+        if lowest is not None:
+            return (lowest, sv)
 
     return (None, None)
 
 
+def _price_value_from_priceobj(price_obj):
+    # prova display_amount
+    display = _get(price_obj, "display_amount", "displayAmount")
+    val = parse_eur_amount(display)
+    if val is not None:
+        return val
+    # prova amount numerico
+    amount = _get(price_obj, "amount", "Amount", "value", "Value")
+    return parse_eur_amount(amount)
+
+
+def _discount_from_savings(savings_obj):
+    if not savings_obj:
+        return 0
+    perc = _get(savings_obj, "percentage", "Percentage", default=0) or 0
+    try:
+        return int(perc)
+    except Exception:
+        return 0
+
+
+def _old_price_from_savings(price_val, savings_obj):
+    if not savings_obj:
+        return price_val
+    amt = _get(savings_obj, "amount", "Amount", default=0) or 0
+    extra = parse_eur_amount(amt)
+    if extra is None:
+        return price_val
+    return float(price_val) + float(extra)
+
+
 # =========================
-# GETITEMS (version-safe)
+# GETITEMS (version-safe + resources)
 # =========================
 def _normalize_items_response(resp):
     if resp is None:
@@ -307,10 +352,7 @@ def _normalize_items_response(resp):
 def safe_get_items_batch(asins):
     """
     Chiama amazon.get_items in modo compatibile con diverse versioni della libreria.
-    Prova:
-    - get_items(item_ids=[...])
-    - get_items(items=[...])
-    - get_items([...]) (posizionale)
+    Tenta anche resources per includere Offers/Prices.
     """
     if not asins:
         return []
@@ -326,16 +368,28 @@ def safe_get_items_batch(asins):
     except Exception:
         sig = None
 
-    # Tentativi in ordine
-    attempts = []
+    # Capisci come si chiama la lista asin in questa versione
+    key_name = None
+    resources_supported = False
     if sig:
         params = sig.parameters
         if "item_ids" in params:
-            attempts.append(("item_ids", {"item_ids": asins}))
-        if "items" in params:
-            attempts.append(("items", {"items": asins}))
+            key_name = "item_ids"
+        elif "items" in params:
+            key_name = "items"
+        resources_supported = ("resources" in params)
 
-    # fallback: prova posizionale
+    attempts = []
+
+    # 1) con resources (se supportato)
+    if key_name and resources_supported:
+        attempts.append(("kw_with_resources", {key_name: asins, "resources": GETITEMS_RESOURCES}))
+
+    # 2) senza resources
+    if key_name:
+        attempts.append(("kw_no_resources", {key_name: asins}))
+
+    # 3) posizionale (con resources non sempre possibile)
     attempts.append(("positional", {"_pos": True}))
 
     last_err = None
@@ -354,10 +408,12 @@ def safe_get_items_batch(asins):
             if DEBUG_FILTERS:
                 print(f"[DEBUG] GetItems fallito ({kind}): {type(e).__name__} -> {repr(e)}")
 
-            # se rate limit, non insistere (evita ban)
             if type(e).__name__ == "TooManyRequests":
                 print("⏳ Rate limit su GetItems: stop batch e riprova più tardi.")
                 break
+            if type(e).__name__ == "MalformedRequest":
+                # se resources causa MalformedRequest, riproverà senza resources nel giro dopo
+                pass
 
     if last_err:
         log_exc("GetItems batch error", last_err)
@@ -380,7 +436,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
-        # 1) SEARCH: prendiamo ASIN + title/img/url (no prezzi affidabili qui)
+        # 1) SEARCH: prendi ASIN
         try:
             results = _search_items_page(kw, page)
             items = getattr(results, "items", []) or []
@@ -392,7 +448,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
         if DEBUG_FILTERS:
             print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
-        # candidati da arricchire con GetItems
         candidates = []
         for it in items:
             asin = (getattr(it, "asin", None) or "").strip().upper()
@@ -420,18 +475,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             reasons["no_candidates"] += 1
             continue
 
-        # 2) GETITEMS: recuperiamo prezzi/offerte
+        # 2) GETITEMS: recupera prezzi/offerte
         asins = [c["asin"] for c in candidates]
         details = safe_get_items_batch(asins)
 
-        # mapping asin->detail
         detail_by_asin = {}
         for d in details:
             a = (getattr(d, "asin", None) or "").strip().upper()
             if a:
                 detail_by_asin[a] = d
 
-        # 3) valuta ogni candidato in ordine
         for c in candidates:
             asin = c["asin"]
             det = detail_by_asin.get(asin)
@@ -441,10 +494,14 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
             price_obj, savings_obj = _extract_price_data(det)
             if not price_obj:
+                # debug: vediamo se proprio manca offers
+                if DEBUG_FILTERS:
+                    has_offers = hasattr(det, "offers") or hasattr(det, "Offers")
+                    print(f"[DEBUG] asin={asin} no_price_obj | has_offers={has_offers}")
                 reasons["no_price_obj"] += 1
                 continue
 
-            price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
+            price_val = _price_value_from_priceobj(price_obj)
             if price_val is None:
                 reasons["bad_price_parse"] += 1
                 continue
@@ -453,13 +510,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["price_out_range"] += 1
                 continue
 
-            disc = int(getattr(savings_obj, "percentage", 0) or 0) if savings_obj else 0
-
-            old_val = price_val
-            try:
-                old_val = price_val + float(getattr(savings_obj, "amount", 0) or 0) if savings_obj else price_val
-            except Exception:
-                old_val = price_val
+            disc = _discount_from_savings(savings_obj)
+            old_val = _old_price_from_savings(price_val, savings_obj)
 
             if REQUIRE_DISCOUNT and disc < MIN_DISCOUNT:
                 reasons["disc_too_low"] += 1

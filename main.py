@@ -25,7 +25,6 @@ FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
 LOGO_PATH = os.environ.get("LOGO_PATH", "header_clean2.png")
 BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
 
-# Se hai Persistent Disk su Render, imposta DATA_DIR=/data
 DATA_DIR = os.environ.get("DATA_DIR", "/tmp/botdata")
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -33,7 +32,6 @@ PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
 PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
 KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 
-# Cooldown per rate limit PA-API
 COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "30"))
 COOLDOWN_FILE = os.path.join(DATA_DIR, "cooldown_until.txt")
 
@@ -42,19 +40,16 @@ MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
 DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
+DEBUG_GETITEMS = os.environ.get("DEBUG_GETITEMS", "1") == "1"
 
-# STRICT_DISCOUNT=1: scarta se disc < MIN_DISCOUNT sempre
-# STRICT_DISCOUNT=0: applica MIN_DISCOUNT solo se Amazon manda savings davvero
 STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
 
-# Riduzione chiamate (consigliato per rientrare nei limiti)
-# Puoi rialzarli quando torna stabile
 SEARCH_INDEX = "All"
-ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "5"))   # era 8
-PAGES = int(os.environ.get("PAGES", "1"))                      # era 4
+ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "5"))
+PAGES = int(os.environ.get("PAGES", "1"))
 
-# Quanti ASIN massimo per pagina mandiamo a GetItems (batch)
-GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "5"))    # era 10
+# per il debug iniziale mettilo a 8–10, poi torni a 5 se serve quota
+GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "8"))
 
 KEYWORDS = [
     "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
@@ -115,7 +110,6 @@ def _in_cooldown():
 # GENERIC HELPERS
 # =========================
 def parse_eur_amount(display_amount: str):
-    """Supporta anche: 1.299,00 € -> 1299.00"""
     if not display_amount:
         return None
     s = str(display_amount)
@@ -279,32 +273,58 @@ def _extract_image_url(item):
 
 def get_items_batch(asins):
     """
-    Firma corretta per la tua libreria:
-    get_items(items) dove items è LISTA ASIN POSIZIONALE.
+    Proviamo due firme diverse per coprire differenze di libreria.
+    Logghiamo SEMPRE cosa succede.
     """
+    asins = [a for a in (asins or []) if a]
     if not asins:
+        if DEBUG_GETITEMS:
+            print("❌ GetItems: lista ASIN vuota, skip.")
         return {}
 
+    if DEBUG_GETITEMS:
+        print(f"[DEBUG] GetItems batch: n_asins={len(asins)} sample={asins[:3]}")
+
     try:
-        r = amazon.get_items(asins)  # <-- QUI è la fix: posizionale, niente item_ids=
+        # Tentativo 1: posizionale (quella che ti dava il TypeError prima se sbagliata)
+        r = amazon.get_items(asins)
         full_items = getattr(r, "items", None) or []
-        out = {}
-        for it in full_items:
-            a = (getattr(it, "asin", None) or "").strip().upper()
-            if a:
-                out[a] = it
-        return out
+        if DEBUG_GETITEMS:
+            print(f"[DEBUG] GetItems ok (posizionale). items={len(full_items)}")
+
+    except TypeError as e:
+        # Tentativo 2: keyword items=...
+        if DEBUG_GETITEMS:
+            print(f"[DEBUG] GetItems TypeError posizionale: {repr(e)} -> provo items=asins")
+        try:
+            r = amazon.get_items(items=asins)
+            full_items = getattr(r, "items", None) or []
+            if DEBUG_GETITEMS:
+                print(f"[DEBUG] GetItems ok (items=). items={len(full_items)}")
+        except Exception as e2:
+            msg2 = repr(e2)
+            print(f"❌ GetItems batch fallito (items=): {msg2}")
+            if "TooManyRequests" in msg2:
+                _set_cooldown(COOLDOWN_MINUTES)
+            return {}
 
     except Exception as e:
         msg = repr(e)
         print(f"❌ GetItems batch fallito: {msg}")
-
         if "TooManyRequests" in msg:
-            print("⏳ Rate limit su GetItems batch: stop keyword e riprova più tardi.")
             _set_cooldown(COOLDOWN_MINUTES)
-            return {}
-
         return {}
+
+    out = {}
+    for it in full_items:
+        a = (getattr(it, "asin", None) or "").strip().upper()
+        if a:
+            out[a] = it
+
+    if DEBUG_GETITEMS and len(out) == 0:
+        print("[DEBUG] GetItems risposta vuota: out=0 (items era vuoto o ASIN non mappati)")
+
+    return out
 
 
 # =========================
@@ -314,7 +334,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
-        # SearchItems SENZA resources (evita MalformedRequest)
         try:
             results = amazon.search_items(
                 keywords=kw,
@@ -326,19 +345,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
         except Exception as e:
             msg = repr(e)
             print(f"❌ ERRORE Amazon PA-API SearchItems (kw='{kw}', page={page}): {msg}")
-
             if "TooManyRequests" in msg:
-                reasons["rate_limited"] += 1
                 _set_cooldown(COOLDOWN_MINUTES)
+                reasons["rate_limited"] += 1
                 return None
-
             reasons["paapi_error"] += 1
             items = []
 
         if DEBUG_FILTERS:
             print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
-        # Candidati (asin non duplicati)
         candidates = []
         for it in items:
             asin = (getattr(it, "asin", None) or "").strip().upper()
@@ -353,7 +369,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
             candidates.append(asin)
 
-        # Se molti item non hanno price, prendiamo dati in batch su primi N candidati
+        # Importante: ora proviamo GetItems su TUTTI i candidati della pagina (max GETITEMS_BATCH)
         full_map = get_items_batch(candidates[:GETITEMS_BATCH])
 
         for it in items:
@@ -401,6 +417,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             except Exception:
                 old_val = price_val
 
+            # Se vuoi test rapido che pubblichi QUALCOSA, metti STRICT_DISCOUNT=0 e MIN_DISCOUNT basso
             if STRICT_DISCOUNT:
                 if disc < MIN_DISCOUNT:
                     reasons["disc_too_low"] += 1
@@ -422,7 +439,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
-                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} (batch_full={'Y' if item_for_data is not it else 'N'})")
+                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc}")
 
             return {
                 "asin": asin,
@@ -569,8 +586,5 @@ def run_once():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# Avvia scheduler in background quando Gunicorn importa il modulo
 start_scheduler_background()
-
-# Alias: se Render avvia main:start_scheduler invece di main:app, non esplode
 start_scheduler = app

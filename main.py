@@ -62,20 +62,19 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
+# >>> MODIFICA CHIAVE: forziamo PA-API a includere Offers/Price <<<
+RESOURCES = [
+    "ItemInfo.Title",
+    "Images.Primary.Large",
+    "Offers.Listings.Price",
+    "Offers.Listings.Savings",
+    "Offers.Listings.Availability.Message",
+]
 
 # =========================
-# INIT
+# INIT CLIENTS
 # =========================
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("Manca TELEGRAM_BOT_TOKEN (env var)")
-
-if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("Manca TELEGRAM_CHAT_ID (env var)")
-
-if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY:
-    raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY (env var)")
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
 
@@ -83,22 +82,13 @@ amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, A
 # HELPERS
 # =========================
 def parse_eur_amount(display_amount: str):
-    """
-    Converte prezzi tipo:
-    - '€ 129,99' -> 129.99
-    - '1.299,00 €' -> 1299.00
-    - '1299,00' -> 1299.00
-    """
+    """Gestisce anche 1.299,00 € -> 1299.00"""
     if not display_amount:
         return None
     s = str(display_amount)
     s = s.replace("\u20ac", "").replace("€", "")
     s = s.replace("\xa0", " ").strip()
-
-    # formato IT: separatore migliaia '.' e decimali ','
-    # esempio: 1.299,00 -> 1299.00
     s = s.replace(".", "").replace(",", ".").strip()
-
     try:
         return float(s)
     except Exception:
@@ -223,7 +213,7 @@ def pick_keyword():
 
 
 # =========================
-# CORE: SEARCH + FILTER
+# CORE SEARCH
 # =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
@@ -235,6 +225,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 item_count=ITEMS_PER_PAGE,
                 search_index=SEARCH_INDEX,
                 item_page=page,
+                resources=RESOURCES,  # <<< MODIFICA CHIAVE
             )
             items = getattr(results, "items", []) or []
         except Exception as e:
@@ -251,7 +242,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["no_asin"] += 1
                 continue
 
-            # attenzione: pubblicati.txt blocca "per sempre" fino al reset
             if asin in pubblicati:
                 reasons["dup_pub_file"] += 1
                 continue
@@ -267,13 +257,14 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             ) or ""
             title = " ".join(title.split())
 
-            try:
-                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
-            except Exception:
-                listing = None
-                reasons["no_listing"] += 1
+            # >>> MODIFICA: separiamo "no_listings" da "no_price_obj"
+            offers = getattr(item, "offers", None)
+            listings = getattr(offers, "listings", None) or []
+            if not listings:
+                reasons["no_listings"] += 1
                 continue
 
+            listing = listings[0]
             price_obj = getattr(listing, "price", None)
             if not price_obj:
                 reasons["no_price_obj"] += 1
@@ -284,7 +275,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             if price_val is None:
                 reasons["bad_price_parse"] += 1
                 if DEBUG_FILTERS:
-                    print(f"[DEBUG] parse KO: display_amount='{raw_amount}'")
+                    print(f"[DEBUG] parse KO display_amount='{raw_amount}'")
                 continue
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
@@ -294,16 +285,12 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
 
-            # prezzo vecchio: se savings manca, non inventiamo
             old_val = price_val
             try:
                 old_val = price_val + float(getattr(savings, "amount", 0) or 0)
             except Exception:
                 old_val = price_val
 
-            # FILTRO SCONTO:
-            # - STRICT_DISCOUNT=0 -> comportamento originale (scarta anche se savings manca/percent=0)
-            # - STRICT_DISCOUNT=0 -> applica MIN_DISCOUNT solo se savings esiste davvero
             if STRICT_DISCOUNT:
                 if disc < MIN_DISCOUNT:
                     reasons["disc_too_low"] += 1
@@ -314,7 +301,11 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     continue
 
             url_img = getattr(
-                getattr(getattr(getattr(item, "images", None), "primary", None), "large", None),
+                getattr(
+                    getattr(getattr(item, "images", None), "primary", None),
+                    "large",
+                    None,
+                ),
                 "url",
                 None,
             )
@@ -329,7 +320,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
-                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} savings={'Y' if savings else 'N'}")
+                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} listings={len(listings)}")
 
             return {
                 "asin": asin,
@@ -344,18 +335,17 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
     if DEBUG_FILTERS:
         print(f"[DEBUG] kw={kw} reasons={dict(reasons)}")
-
     return None
 
 
-# =========================
-# SEND
-# =========================
 def invia_offerta():
+    if bot is None:
+        print("❌ TELEGRAM_BOT_TOKEN mancante.")
+        return False
+
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
-
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -382,19 +372,13 @@ def invia_offerta():
     safe_url = html.escape(url, quote=True)
 
     caption_parts = [f"📌 <b>{safe_title}</b>"]
-
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
-    # Se disc==0 o old==new, evita testo brutto
-    if sconto > 0 and prezzo_vecchio_val > prezzo_nuovo_val:
-        caption_parts.append(
-            f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
-            f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
-        )
-    else:
-        caption_parts.append(f"💶 Prezzo attuale: <b>{prezzo_nuovo_val:.2f}€</b>")
-
+    caption_parts.append(
+        f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
+        f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
+    )
     caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
     caption = "\n\n".join(caption_parts)
 
@@ -414,15 +398,16 @@ def invia_offerta():
     return True
 
 
-# =========================
-# TIME WINDOW (Italy)
-# =========================
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
 
     month = now_utc.month
-    offset_hours = 2 if 4 <= month <= 10 else 1  # CET/CEST approx
+    if 4 <= month <= 10:
+        offset_hours = 2  # CEST approx
+    else:
+        offset_hours = 1  # CET approx
+
     italy_time = now_utc + timedelta(hours=offset_hours)
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time

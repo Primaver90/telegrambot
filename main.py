@@ -217,17 +217,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             if not price_obj:
                 continue
 
-            try:
-                price_str = (
-                    str(getattr(price_obj, "display_amount", ""))
-                    .replace("\u20ac", "")
-                    .replace("€", "")
-                    .replace(",", ".")
-                    .strip()
-                )
-                price_val = float(price_str)
-            except Exception:
-                continue
+            
 def parse_eur_amount(display_amount: str):
     if not display_amount:
         return None

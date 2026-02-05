@@ -21,6 +21,7 @@ AMAZON_COUNTRY = os.environ.get("AMAZON_COUNTRY", "IT")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7687135950:AAHfRV6b4RgAcVU6j71wDfZS-1RTMJ15ajg")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1001010781022")
 
+
 FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
 LOGO_PATH = os.environ.get("LOGO_PATH", "header_clean2.png")
 BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
@@ -42,13 +43,16 @@ MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
 DEBUG_GETITEMS = os.environ.get("DEBUG_GETITEMS", "1") == "1"
 
+# Se 1, scarta SEMPRE se disc < MIN_DISCOUNT
 STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
+
+# Se 1, pubblica SOLO se disc >= MIN_DISCOUNT (consigliato per bot offerte)
+REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
 SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "5"))
 PAGES = int(os.environ.get("PAGES", "1"))
 
-# per il debug iniziale mettilo a 8–10, poi torni a 5 se serve quota
 GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "8"))
 
 KEYWORDS = [
@@ -110,6 +114,7 @@ def _in_cooldown():
 # GENERIC HELPERS
 # =========================
 def parse_eur_amount(display_amount: str):
+    """Supporta anche: 1.299,00 € -> 1299.00"""
     if not display_amount:
         return None
     s = str(display_amount)
@@ -242,14 +247,6 @@ def pick_keyword():
 # =========================
 # AMAZON HELPERS
 # =========================
-def _extract_price_obj(item):
-    try:
-        listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
-    except Exception:
-        listing = None
-    return getattr(listing, "price", None) if listing else None
-
-
 def _extract_title(item):
     title = getattr(
         getattr(getattr(item, "item_info", None), "title", None),
@@ -271,10 +268,53 @@ def _extract_image_url(item):
     )
 
 
+def _extract_price_data(item):
+    """
+    Prova a trovare prezzo/savings sia da offers.listings che da offers.summaries.
+    Ritorna: (price_obj, savings_obj)
+    """
+    offers = getattr(item, "offers", None)
+    if not offers:
+        return (None, None)
+
+    # 1) listings[0].price (path "classico")
+    try:
+        listing = getattr(offers, "listings", [None])[0]
+    except Exception:
+        listing = None
+
+    if listing is not None:
+        price_obj = getattr(listing, "price", None)
+        if price_obj is not None:
+            return (price_obj, getattr(price_obj, "savings", None))
+
+    # 2) summaries[0].lowest_price (alcune risposte PA-API)
+    try:
+        summaries = getattr(offers, "summaries", []) or []
+        s0 = summaries[0] if summaries else None
+    except Exception:
+        s0 = None
+
+    if s0 is not None:
+        lp = getattr(s0, "lowest_price", None) or getattr(s0, "lowestPrice", None)
+        sv = getattr(s0, "savings", None)
+        if lp is not None:
+            return (lp, sv)
+
+    return (None, None)
+
+
+def _debug_response_errors(r, label=""):
+    # Proviamo a stampare eventuali errors in risposta (varia a seconda del wrapper)
+    errs = getattr(r, "errors", None) or getattr(r, "Errors", None) or getattr(r, "error", None)
+    if errs:
+        print(f"[DEBUG] {label} errors={errs}")
+
+
 def get_items_batch(asins):
     """
-    Proviamo due firme diverse per coprire differenze di libreria.
-    Logghiamo SEMPRE cosa succede.
+    Fix: proviamo più firme per coprire differenze di libreria.
+    Inoltre: se items=0, stampiamo errors.
     """
     asins = [a for a in (asins or []) if a]
     if not asins:
@@ -285,44 +325,56 @@ def get_items_batch(asins):
     if DEBUG_GETITEMS:
         print(f"[DEBUG] GetItems batch: n_asins={len(asins)} sample={asins[:3]}")
 
-    try:
-        # Tentativo 1: posizionale (quella che ti dava il TypeError prima se sbagliata)
-        r = amazon.get_items(asins)
-        full_items = getattr(r, "items", None) or []
-        if DEBUG_GETITEMS:
-            print(f"[DEBUG] GetItems ok (posizionale). items={len(full_items)}")
+    attempts = []
 
-    except TypeError as e:
-        # Tentativo 2: keyword items=...
-        if DEBUG_GETITEMS:
-            print(f"[DEBUG] GetItems TypeError posizionale: {repr(e)} -> provo items=asins")
+    # Tentativo A: item_ids=...
+    attempts.append(("item_ids=", lambda: amazon.get_items(item_ids=asins)))
+
+    # Tentativo B: items=...
+    attempts.append(("items=", lambda: amazon.get_items(items=asins)))
+
+    # Tentativo C: posizionale
+    attempts.append(("posizionale", lambda: amazon.get_items(asins)))
+
+    last_err = None
+    full_items = []
+
+    for name, fn in attempts:
         try:
-            r = amazon.get_items(items=asins)
-            full_items = getattr(r, "items", None) or []
+            r = fn()
+            items = getattr(r, "items", None) or []
             if DEBUG_GETITEMS:
-                print(f"[DEBUG] GetItems ok (items=). items={len(full_items)}")
-        except Exception as e2:
-            msg2 = repr(e2)
-            print(f"❌ GetItems batch fallito (items=): {msg2}")
-            if "TooManyRequests" in msg2:
+                print(f"[DEBUG] GetItems ok ({name}). items={len(items)}")
+            if len(items) == 0:
+                _debug_response_errors(r, f"GetItems({name})")
+            full_items = items
+            if full_items:
+                break
+        except TypeError as e:
+            if DEBUG_GETITEMS:
+                print(f"[DEBUG] GetItems TypeError ({name}): {repr(e)}")
+            last_err = e
+            continue
+        except Exception as e:
+            msg = repr(e)
+            print(f"❌ GetItems fallito ({name}): {msg}")
+            if "TooManyRequests" in msg:
                 _set_cooldown(COOLDOWN_MINUTES)
-            return {}
+                return {}
+            last_err = e
+            continue
 
-    except Exception as e:
-        msg = repr(e)
-        print(f"❌ GetItems batch fallito: {msg}")
-        if "TooManyRequests" in msg:
-            _set_cooldown(COOLDOWN_MINUTES)
-        return {}
+    if DEBUG_GETITEMS and len(full_items) == 0:
+        if last_err:
+            print(f"[DEBUG] GetItems: nessun item restituito. last_err={repr(last_err)}")
+        else:
+            print("[DEBUG] GetItems: risposta vuota (items=0) senza eccezioni.")
 
     out = {}
     for it in full_items:
         a = (getattr(it, "asin", None) or "").strip().upper()
         if a:
             out[a] = it
-
-    if DEBUG_GETITEMS and len(out) == 0:
-        print("[DEBUG] GetItems risposta vuota: out=0 (items era vuoto o ASIN non mappati)")
 
     return out
 
@@ -369,7 +421,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
             candidates.append(asin)
 
-        # Importante: ora proviamo GetItems su TUTTI i candidati della pagina (max GETITEMS_BATCH)
+        # GetItems sui primi N candidati (aumenta GETITEMS_BATCH se serve)
         full_map = get_items_batch(candidates[:GETITEMS_BATCH])
 
         for it in items:
@@ -378,7 +430,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
 
             title = _extract_title(it) or ""
-            price_obj = _extract_price_obj(it)
+            price_obj, savings_obj = _extract_price_data(it)
 
             item_for_data = it
             if not price_obj:
@@ -390,14 +442,14 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     continue
 
                 item_for_data = full
-                price_obj = _extract_price_obj(full)
-                if not price_obj:
-                    reasons["getitems_no_price"] += 1
-                    continue
-
                 title2 = _extract_title(full)
                 if title2:
                     title = title2
+
+                price_obj, savings_obj = _extract_price_data(full)
+                if not price_obj:
+                    reasons["getitems_no_price"] += 1
+                    continue
 
             price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
             if price_val is None:
@@ -408,24 +460,21 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["price_out_range"] += 1
                 continue
 
-            savings = getattr(price_obj, "savings", None)
-            disc = int(getattr(savings, "percentage", 0) or 0)
+            disc = int(getattr(savings_obj, "percentage", 0) or 0) if savings_obj else 0
 
             old_val = price_val
             try:
-                old_val = price_val + float(getattr(savings, "amount", 0) or 0)
+                old_val = price_val + float(getattr(savings_obj, "amount", 0) or 0) if savings_obj else price_val
             except Exception:
                 old_val = price_val
 
-            # Se vuoi test rapido che pubblichi QUALCOSA, metti STRICT_DISCOUNT=0 e MIN_DISCOUNT basso
-            if STRICT_DISCOUNT:
-                if disc < MIN_DISCOUNT:
-                    reasons["disc_too_low"] += 1
-                    continue
-            else:
-                if savings and disc < MIN_DISCOUNT:
-                    reasons["disc_too_low"] += 1
-                    continue
+            if REQUIRE_DISCOUNT and disc < MIN_DISCOUNT:
+                reasons["disc_too_low"] += 1
+                continue
+
+            if STRICT_DISCOUNT and disc < MIN_DISCOUNT:
+                reasons["disc_too_low"] += 1
+                continue
 
             url_img = _extract_image_url(item_for_data)
             if not url_img:
@@ -504,14 +553,10 @@ def invia_offerta():
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
-    if sconto > 0 and prezzo_vecchio_val > prezzo_nuovo_val:
-        caption_parts.append(
-            f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
-            f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
-        )
-    else:
-        caption_parts.append(f"💶 Prezzo attuale: <b>{prezzo_nuovo_val:.2f}€</b>")
-
+    caption_parts.append(
+        f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
+        f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
+    )
     caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
     caption = "\n\n".join(caption_parts)
 

@@ -9,8 +9,6 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from amazon_paapi import AmazonApi
-from flask import Flask
-import threading
 
 AMAZON_ACCESS_KEY = os.environ.get("AMAZON_ACCESS_KEY", "AKPAZS2VGY1748024339")
 AMAZON_SECRET_KEY = os.environ.get("AMAZON_SECRET_KEY", "yiA1TX0xWWVtW1HgKpkR2LWZpklQXaJ2k9D4HsiL")
@@ -61,44 +59,8 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
-# =========================
-# APP (per gunicorn app:app)
-# =========================
-app = Flask(__name__)
-
-@app.get("/")
-def health():
-    return "ok", 200
-
-# =========================
-# CLIENTS
-# =========================
-if TELEGRAM_BOT_TOKEN:
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
-else:
-    bot = None
-
-if AMAZON_ACCESS_KEY and AMAZON_SECRET_KEY:
-    amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
-else:
-    amazon = None
-
-
-# =========================
-# UTILS
-# =========================
-def parse_eur_amount(display_amount: str):
-    """Parsa importi tipo '1.299,00 €' -> 1299.00"""
-    if not display_amount:
-        return None
-    s = str(display_amount)
-    s = s.replace("\u20ac", "").replace("€", "")
-    s = s.replace("\xa0", " ").strip()
-    s = s.replace(".", "").replace(",", ".").strip()
-    try:
-        return float(s)
-    except:
-        return None
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
 
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
@@ -219,10 +181,6 @@ def pick_keyword():
 
 
 def _first_valid_item_for_keyword(kw, pubblicati):
-    if amazon is None:
-        print("❌ AmazonApi non configurata (mancano env vars).")
-        return None
-
     for page in range(1, PAGES + 1):
         try:
             results = amazon.search_items(
@@ -249,7 +207,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             title = " ".join(title.split())
 
             try:
-                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
+                listing = getattr(
+                    getattr(item, "offers", None), "listings", [None]
+                )[0]
             except Exception:
                 listing = None
 
@@ -257,8 +217,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             if not price_obj:
                 continue
 
-            price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
-            if price_val is None:
+            try:
+                price_str = (
+                    str(getattr(price_obj, "display_amount", ""))
+                    .replace("\u20ac", "")
+                    .replace("€", "")
+                    .replace(",", ".")
+                    .strip()
+                )
+                price_val = float(price_str)
+            except Exception:
                 continue
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
@@ -272,12 +240,18 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
 
             url_img = getattr(
-                getattr(getattr(getattr(item, "images", None), "primary", None), "large", None),
+                getattr(
+                    getattr(getattr(item, "images", None), "primary", None),
+                    "large",
+                    None,
+                ),
                 "url",
                 None,
             )
             if not url_img:
-                url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+                url_img = (
+                    "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+                )
 
             url = getattr(item, "detail_page_url", None)
             if not url and asin:
@@ -297,13 +271,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             }
 
     return None
-
-
+        
 def invia_offerta():
-    if bot is None:
-        print("❌ Bot Telegram non configurato (manca TELEGRAM_BOT_TOKEN).")
-        return False
-
     pubblicati = load_pubblicati()
     kw = pick_keyword()
     payload = _first_valid_item_for_keyword(kw, pubblicati)
@@ -332,7 +301,9 @@ def invia_offerta():
     safe_title = html.escape(titolo)
     safe_url = html.escape(url, quote=True)
 
-    caption_parts = [f"📌 <b>{safe_title}</b>"]
+    caption_parts = [
+        f"📌 <b>{safe_title}</b>",
+    ]
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
@@ -344,7 +315,9 @@ def invia_offerta():
 
     caption = "\n\n".join(caption_parts)
 
-    button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
+    button = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛒 Acquista ora", url=url)]]
+    )
 
     bot.send_photo(
         chat_id=TELEGRAM_CHAT_ID,
@@ -359,13 +332,16 @@ def invia_offerta():
     print(f"✅ Pubblicata: {asin} | {kw}")
     return True
 
-
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
 
     month = now_utc.month
-    offset_hours = 2 if 4 <= month <= 10 else 1
+    if 4 <= month <= 10:
+        offset_hours = 2  # CEST (circa aprile–ottobre)
+    else:
+        offset_hours = 1  # CET (circa novembre–marzo)
+
     italy_time = now_utc + timedelta(hours=offset_hours)
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time
@@ -377,7 +353,9 @@ def run_if_in_fascia_oraria():
     if in_window:
         invia_offerta()
     else:
-        print(f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata.")
+        print(
+            f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata."
+        )
 
 
 def start_scheduler():
@@ -387,20 +365,3 @@ def start_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(5)
-
-
-# =========================
-# START SCHEDULER IN BACKGROUND
-# =========================
-_scheduler_started = False
-
-def ensure_scheduler_started():
-    global _scheduler_started
-    if _scheduler_started:
-        return
-    _scheduler_started = True
-    t = threading.Thread(target=start_scheduler, daemon=True)
-    t.start()
-    print("✅ Scheduler avviato in background")
-
-ensure_scheduler_started()

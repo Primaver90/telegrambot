@@ -692,3 +692,4 @@ def run_once():
 
 
 start_scheduler_background()
+start_scheduler = app

@@ -228,6 +228,26 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 price_val = float(price_str)
             except Exception:
                 continue
+def parse_eur_amount(display_amount: str):
+    if not display_amount:
+        return None
+    s = str(display_amount)
+    
+    s = s.replace("\u20ac", "").replace("€", "")
+    s = s.replace("\xa0", " ").strip()
+    
+    s = s.replace(".", "").replace(",", ".")
+    s = s.strip()
+
+    try:
+        return float(s)
+    except:
+        return None
+
+# ...
+price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
+if price_val is None:
+    continue    
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
                 continue

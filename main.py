@@ -1,17 +1,18 @@
 import os
-from io import BytesIO
-from datetime import datetime, timedelta
 import time
-import schedule
-import requests
 import html
 import threading
-from collections import Counter
+from io import BytesIO
 from pathlib import Path
-from flask import Flask, jsonify
+from datetime import datetime, timedelta
+from collections import Counter
+
+import schedule
+import requests
 from PIL import Image, ImageDraw, ImageFont
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 from amazon_paapi import AmazonApi
+from flask import Flask, jsonify
 
 AMAZON_ACCESS_KEY = os.environ.get("AMAZON_ACCESS_KEY", "AKPAZS2VGY1748024339")
 AMAZON_SECRET_KEY = os.environ.get("AMAZON_SECRET_KEY", "yiA1TX0xWWVtW1HgKpkR2LWZpklQXaJ2k9D4HsiL")
@@ -24,45 +25,44 @@ FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
 LOGO_PATH = os.environ.get("LOGO_PATH", "header_clean2.png")
 BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
 
-DATA_DIR = "/tmp/botdata"
+# Se hai Persistent Disk su Render, imposta DATA_DIR=/data
+DATA_DIR = os.environ.get("DATA_DIR", "/tmp/botdata")
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
 PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
 KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 
+# Cooldown per rate limit PA-API
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "30"))
+COOLDOWN_FILE = os.path.join(DATA_DIR, "cooldown_until.txt")
+
 MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
-DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
-STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
-GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "10") or 10)
-KEYWORDS = [
-    "Apple",
-    "Android",
-    "iPhone",
-    "MacBook",
-    "tablet",
-    "smartwatch",
-    "auricolari Bluetooth",
-    "smart TV",
-    "monitor PC",
-    "notebook",
-    "gaming mouse",
-    "gaming tastiera",
-    "console",
-    "soundbar",
-    "smart home",
-    "aspirapolvere robot",
-    "telecamere WiFi",
-    "caricatore wireless",
-    "accessori smartphone",
-    "accessori iPhone",
-]
 
+DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
+
+# STRICT_DISCOUNT=1: scarta se disc < MIN_DISCOUNT sempre
+# STRICT_DISCOUNT=0: applica MIN_DISCOUNT solo se Amazon manda savings davvero
+STRICT_DISCOUNT = os.environ.get("STRICT_DISCOUNT", "0") == "1"
+
+# Riduzione chiamate (consigliato per rientrare nei limiti)
+# Puoi rialzarli quando torna stabile
 SEARCH_INDEX = "All"
-ITEMS_PER_PAGE = 8
-PAGES = 4
+ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "5"))   # era 8
+PAGES = int(os.environ.get("PAGES", "1"))                      # era 4
+
+# Quanti ASIN massimo per pagina mandiamo a GetItems (batch)
+GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "5"))    # era 10
+
+KEYWORDS = [
+    "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
+    "auricolari Bluetooth", "smart TV", "monitor PC", "notebook",
+    "gaming mouse", "gaming tastiera", "console", "soundbar", "smart home",
+    "aspirapolvere robot", "telecamere WiFi", "caricatore wireless",
+    "accessori smartphone", "accessori iPhone",
+]
 
 
 # =========================
@@ -84,7 +84,35 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 
 # =========================
-# HELPERS
+# COOLDOWN HELPERS
+# =========================
+def _cooldown_until():
+    try:
+        if not os.path.exists(COOLDOWN_FILE):
+            return None
+        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
+            ts = f.read().strip()
+        if not ts:
+            return None
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def _set_cooldown(minutes: int):
+    until = datetime.utcnow() + timedelta(minutes=minutes)
+    with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
+        f.write(until.isoformat())
+    print(f"⏳ Cooldown attivato fino a {until.isoformat()} UTC (per rate limit).")
+
+
+def _in_cooldown():
+    until = _cooldown_until()
+    return bool(until and until > datetime.utcnow())
+
+
+# =========================
+# GENERIC HELPERS
 # =========================
 def parse_eur_amount(display_amount: str):
     """Supporta anche: 1.299,00 € -> 1299.00"""
@@ -217,35 +245,9 @@ def pick_keyword():
     return kw
 
 
-def get_items_batch(asins):
-    """
-    CHIAVE: la tua libreria vuole get_items(items) dove items è LISTA ASIN POSIZIONALE.
-    Qui facciamo una sola chiamata per pagina (batch), così non bruci quota.
-    """
-    if not asins:
-        return {}
-
-    try:
-        # firma corretta per te: primo argomento posizionale = items
-        r = amazon.get_items(asins)
-        full_items = getattr(r, "items", None) or []
-        out = {}
-        for it in full_items:
-            a = (getattr(it, "asin", None) or "").strip().upper()
-            if a:
-                out[a] = it
-        return out
-
-    except Exception as e:
-        msg = repr(e)
-        print(f"❌ GetItems batch fallito: {msg}")
-
-        # se rate limit, fermiamoci subito
-        if "TooManyRequests" in msg:
-            print("⏳ Rate limit su GetItems batch: stop keyword e riprova più tardi.")
-        return {}
-
-
+# =========================
+# AMAZON HELPERS
+# =========================
 def _extract_price_obj(item):
     try:
         listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
@@ -264,7 +266,7 @@ def _extract_title(item):
 
 
 def _extract_image_url(item):
-    url_img = getattr(
+    return getattr(
         getattr(
             getattr(getattr(item, "images", None), "primary", None),
             "large",
@@ -273,9 +275,41 @@ def _extract_image_url(item):
         "url",
         None,
     )
-    return url_img
 
 
+def get_items_batch(asins):
+    """
+    Firma corretta per la tua libreria:
+    get_items(items) dove items è LISTA ASIN POSIZIONALE.
+    """
+    if not asins:
+        return {}
+
+    try:
+        r = amazon.get_items(asins)  # <-- QUI è la fix: posizionale, niente item_ids=
+        full_items = getattr(r, "items", None) or []
+        out = {}
+        for it in full_items:
+            a = (getattr(it, "asin", None) or "").strip().upper()
+            if a:
+                out[a] = it
+        return out
+
+    except Exception as e:
+        msg = repr(e)
+        print(f"❌ GetItems batch fallito: {msg}")
+
+        if "TooManyRequests" in msg:
+            print("⏳ Rate limit su GetItems batch: stop keyword e riprova più tardi.")
+            _set_cooldown(COOLDOWN_MINUTES)
+            return {}
+
+        return {}
+
+
+# =========================
+# CORE LOGIC
+# =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
@@ -295,8 +329,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
             if "TooManyRequests" in msg:
                 reasons["rate_limited"] += 1
-                if DEBUG_FILTERS:
-                    print("[DEBUG] Rate limit su SearchItems: stop keyword.")
+                _set_cooldown(COOLDOWN_MINUTES)
                 return None
 
             reasons["paapi_error"] += 1
@@ -320,11 +353,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
             candidates.append(asin)
 
-        # Se SearchItems non porta price, facciamo un GetItems batch sui primi N candidati
-        # (una sola chiamata, non 30 chiamate)
+        # Se molti item non hanno price, prendiamo dati in batch su primi N candidati
         full_map = get_items_batch(candidates[:GETITEMS_BATCH])
 
-        # Ora iteriamo gli items in ordine e proviamo a costruire un payload valido
         for it in items:
             asin = (getattr(it, "asin", None) or "").strip().upper()
             if not asin or asin not in candidates:
@@ -333,14 +364,15 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             title = _extract_title(it) or ""
             price_obj = _extract_price_obj(it)
 
-            # se manca price su search, prova full item
             item_for_data = it
             if not price_obj:
                 reasons["no_price_obj"] += 1
+
                 full = full_map.get(asin)
                 if not full:
                     reasons["getitems_failed"] += 1
                     continue
+
                 item_for_data = full
                 price_obj = _extract_price_obj(full)
                 if not price_obj:
@@ -405,10 +437,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
     if DEBUG_FILTERS:
         print(f"[DEBUG] kw={kw} reasons={dict(reasons)}")
+
     return None
 
 
 def invia_offerta():
+    if _in_cooldown():
+        until = _cooldown_until()
+        print(f"⏳ In cooldown fino a {until.isoformat()} UTC: salto invio.")
+        return False
+
     if bot is None:
         print("❌ TELEGRAM_BOT_TOKEN mancante.")
         return False

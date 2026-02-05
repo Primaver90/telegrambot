@@ -32,24 +32,18 @@ PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
 PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
 KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "30"))
-COOLDOWN_FILE = os.path.join(DATA_DIR, "cooldown_until.txt")
-
 MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
 DEBUG_FILTERS = os.environ.get("DEBUG_FILTERS", "1") == "1"
-DEBUG_GETITEMS = os.environ.get("DEBUG_GETITEMS", "1") == "1"
 
-# 1 = richiede sconto, 0 = accetta anche prezzo senza sconto (solo per test)
+# 1 = richiede sconto, 0 = (solo test) accetta anche prezzo senza sconto
 REQUIRE_DISCOUNT = os.environ.get("REQUIRE_DISCOUNT", "1") == "1"
 
 SEARCH_INDEX = "All"
-ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "5"))
-PAGES = int(os.environ.get("PAGES", "1"))
-
-GETITEMS_BATCH = int(os.environ.get("GETITEMS_BATCH", "8"))
+ITEMS_PER_PAGE = int(os.environ.get("ITEMS_PER_PAGE", "8"))
+PAGES = int(os.environ.get("PAGES", "4"))
 
 KEYWORDS = [
     "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
@@ -79,35 +73,7 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 
 # =========================
-# COOLDOWN HELPERS
-# =========================
-def _cooldown_until():
-    try:
-        if not os.path.exists(COOLDOWN_FILE):
-            return None
-        with open(COOLDOWN_FILE, "r", encoding="utf-8") as f:
-            ts = f.read().strip()
-        if not ts:
-            return None
-        return datetime.fromisoformat(ts)
-    except Exception:
-        return None
-
-
-def _set_cooldown(minutes: int):
-    until = datetime.utcnow() + timedelta(minutes=minutes)
-    with open(COOLDOWN_FILE, "w", encoding="utf-8") as f:
-        f.write(until.isoformat())
-    print(f"⏳ Cooldown attivato fino a {until.isoformat()} UTC (rate limit).")
-
-
-def _in_cooldown():
-    until = _cooldown_until()
-    return bool(until and until > datetime.utcnow())
-
-
-# =========================
-# GENERIC HELPERS
+# HELPERS
 # =========================
 def parse_eur_amount(display_amount: str):
     """Supporta anche: 1.299,00 € -> 1299.00"""
@@ -241,7 +207,7 @@ def pick_keyword():
 
 
 # =========================
-# AMAZON HELPERS
+# AMAZON EXTRACTORS
 # =========================
 def _extract_title(item):
     title = getattr(
@@ -269,31 +235,37 @@ def _extract_price_data(item):
     Prova prezzo/savings da:
     - offers.listings[0].price
     - offers.summaries[0].lowest_price
+    - fallback varianti naming
     """
     offers = getattr(item, "offers", None)
     if not offers:
         return (None, None)
 
-    # listings
+    # listings[0].price
     try:
-        listing = getattr(offers, "listings", [None])[0]
+        listings = getattr(offers, "listings", None) or []
+        listing0 = listings[0] if listings else None
     except Exception:
-        listing = None
+        listing0 = None
 
-    if listing is not None:
-        price_obj = getattr(listing, "price", None)
+    if listing0 is not None:
+        price_obj = getattr(listing0, "price", None)
         if price_obj is not None:
             return (price_obj, getattr(price_obj, "savings", None))
 
-    # summaries
+    # summaries[0].lowest_price
     try:
-        summaries = getattr(offers, "summaries", []) or []
+        summaries = getattr(offers, "summaries", None) or []
         s0 = summaries[0] if summaries else None
     except Exception:
         s0 = None
 
     if s0 is not None:
-        lp = getattr(s0, "lowest_price", None) or getattr(s0, "lowestPrice", None)
+        lp = (
+            getattr(s0, "lowest_price", None)
+            or getattr(s0, "lowestPrice", None)
+            or getattr(s0, "lowestprice", None)
+        )
         sv = getattr(s0, "savings", None)
         if lp is not None:
             return (lp, sv)
@@ -301,180 +273,54 @@ def _extract_price_data(item):
     return (None, None)
 
 
-def extract_items_any(resp):
-    """
-    Estrae items da diversi possibili layout del wrapper.
-    Ritorna sempre una lista.
-    """
-    if resp is None:
-        return []
-
-    # Caso 1: resp.items
-    items = getattr(resp, "items", None)
-    if isinstance(items, list) and items:
-        return items
-
-    # Caso 2: resp.items_result.items / resp.itemsResult.items
-    for container_name in ("items_result", "itemsResult", "ItemsResult", "itemsresult"):
-        cont = getattr(resp, container_name, None)
-        if cont is not None:
-            it2 = getattr(cont, "items", None)
-            if isinstance(it2, list) and it2:
-                return it2
-
-    # Caso 3: dict-like
-    if isinstance(resp, dict):
-        for k in ("items", "Items", "ItemsResult", "itemsResult"):
-            v = resp.get(k)
-            if isinstance(v, list) and v:
-                return v
-            if isinstance(v, dict):
-                vv = v.get("items") or v.get("Items")
-                if isinstance(vv, list) and vv:
-                    return vv
-
-    return items if isinstance(items, list) else []
-
-
-def extract_errors_any(resp):
-    """
-    Estrae errors da vari possibili layout.
-    """
-    if resp is None:
-        return None
-
-    # attr comuni
-    for k in ("errors", "Errors", "error", "Error", "errors_result", "errorsResult", "ErrorsResult"):
-        v = getattr(resp, k, None)
-        if v:
-            return v
-
-    # nested dict
-    if isinstance(resp, dict):
-        for k in ("errors", "Errors", "Error", "ErrorsResult"):
-            v = resp.get(k)
-            if v:
-                return v
-
-    # prova a vedere se esiste qualche campo "raw" o simile
-    raw = getattr(resp, "raw", None) or getattr(resp, "data", None) or getattr(resp, "response", None)
-    if isinstance(raw, dict):
-        for k in ("Errors", "errors"):
-            if raw.get(k):
-                return raw.get(k)
-
-    return None
-
-
-def get_items_batch(asins):
-    """
-    La tua libreria vuole get_items(items=...).
-    Qui però: se items=0, stampiamo attrs + errors, perché spesso lì c’è la causa.
-    """
-    asins = [a for a in (asins or []) if a]
-    if not asins:
-        if DEBUG_GETITEMS:
-            print("❌ GetItems: lista ASIN vuota, skip.")
-        return {}
-
-    if DEBUG_GETITEMS:
-        print(f"[DEBUG] GetItems batch: n_asins={len(asins)} sample={asins[:3]}")
-
-    # Tentiamo solo le firme "realistiche" per il tuo wrapper
-    attempts = []
-
-    # 1) items=...
-    attempts.append(("items=", lambda: amazon.get_items(items=asins)))
-
-    # 2) posizionale (nel tuo caso non dà TypeError, ma comunque può andare)
-    attempts.append(("posizionale", lambda: amazon.get_items(asins)))
-
-    last_err = None
-    full_items = []
-    last_resp = None
-
-    for name, fn in attempts:
-        try:
-            r = fn()
-            last_resp = r
-            items = extract_items_any(r)
-            if DEBUG_GETITEMS:
-                attrs = [a for a in dir(r) if not a.startswith("_")]
-                print(f"[DEBUG] GetItems resp type={type(r)} attrs_sample={attrs[:20]}")
-                print(f"[DEBUG] GetItems ok ({name}). extracted_items={len(items)}")
-
-            if len(items) == 0:
-                errs = extract_errors_any(r)
-                if DEBUG_GETITEMS:
-                    print(f"[DEBUG] GetItems errors={errs}")
-                full_items = []
-                continue
-
-            full_items = items
-            break
-
-        except TypeError as e:
-            if DEBUG_GETITEMS:
-                print(f"[DEBUG] GetItems TypeError ({name}): {repr(e)}")
-            last_err = e
-            continue
-        except Exception as e:
-            msg = repr(e)
-            print(f"❌ GetItems fallito ({name}): {msg}")
-            if "TooManyRequests" in msg:
-                _set_cooldown(COOLDOWN_MINUTES)
-                return {}
-            last_err = e
-            continue
-
-    if DEBUG_GETITEMS and len(full_items) == 0:
-        if last_err:
-            print(f"[DEBUG] GetItems: nessun item restituito. last_err={repr(last_err)}")
-        else:
-            print("[DEBUG] GetItems: risposta vuota (items=0) senza eccezioni.")
-        if last_resp is not None:
-            errs = extract_errors_any(last_resp)
-            if errs:
-                print(f"[DEBUG] GetItems FINAL errors={errs}")
-
-    out = {}
-    for it in full_items:
-        a = (getattr(it, "asin", None) or "").strip().upper()
-        if a:
-            out[a] = it
-    return out
-
-
 # =========================
-# CORE LOGIC
+# CORE
 # =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
+    # Resources “best effort”: se la libreria li supporta, SearchItems tornerà già offers/price.
+    # Se NON li supporta, verranno ignorati o lanceranno TypeError -> gestito sotto.
+    resources = [
+        "ItemInfo.Title",
+        "Images.Primary.Large",
+        "Offers.Listings.Price",
+        "Offers.Listings.Savings",
+        "Offers.Summaries.LowestPrice",
+        "Offers.Summaries.Savings",
+    ]
+
     for page in range(1, PAGES + 1):
+        # --- SEARCH ITEMS ---
         try:
-            results = amazon.search_items(
-                keywords=kw,
-                item_count=ITEMS_PER_PAGE,
-                search_index=SEARCH_INDEX,
-                item_page=page,
-            )
+            try:
+                results = amazon.search_items(
+                    keywords=kw,
+                    item_count=ITEMS_PER_PAGE,
+                    search_index=SEARCH_INDEX,
+                    item_page=page,
+                    resources=resources,
+                )
+            except TypeError:
+                # wrapper non supporta resources -> fallback
+                results = amazon.search_items(
+                    keywords=kw,
+                    item_count=ITEMS_PER_PAGE,
+                    search_index=SEARCH_INDEX,
+                    item_page=page,
+                )
+
             items = getattr(results, "items", []) or []
         except Exception as e:
-            msg = repr(e)
-            print(f"❌ ERRORE SearchItems (kw='{kw}', page={page}): {msg}")
-            if "TooManyRequests" in msg:
-                _set_cooldown(COOLDOWN_MINUTES)
-                return None
+            print(f"❌ ERRORE SearchItems (kw='{kw}', page={page}): {repr(e)}")
             reasons["paapi_error"] += 1
             items = []
 
         if DEBUG_FILTERS:
             print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
 
-        candidates = []
-        for it in items:
-            asin = (getattr(it, "asin", None) or "").strip().upper()
+        for item in items:
+            asin = (getattr(item, "asin", None) or "").strip().upper()
             if not asin:
                 reasons["no_asin"] += 1
                 continue
@@ -484,36 +330,13 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             if not can_post(asin, hours=24):
                 reasons["dup_24h"] += 1
                 continue
-            candidates.append(asin)
 
-        full_map = get_items_batch(candidates[:GETITEMS_BATCH])
+            title = _extract_title(item) or ""
+            price_obj, savings_obj = _extract_price_data(item)
 
-        for it in items:
-            asin = (getattr(it, "asin", None) or "").strip().upper()
-            if not asin or asin not in candidates:
-                continue
-
-            title = _extract_title(it) or ""
-            price_obj, savings_obj = _extract_price_data(it)
-
-            item_for_data = it
             if not price_obj:
                 reasons["no_price_obj"] += 1
-
-                full = full_map.get(asin)
-                if not full:
-                    reasons["getitems_failed"] += 1
-                    continue
-
-                item_for_data = full
-                title2 = _extract_title(full)
-                if title2:
-                    title = title2
-
-                price_obj, savings_obj = _extract_price_data(full)
-                if not price_obj:
-                    reasons["getitems_no_price"] += 1
-                    continue
+                continue
 
             price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
             if price_val is None:
@@ -536,9 +359,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["disc_too_low"] += 1
                 continue
 
-            url_img = _extract_image_url(item_for_data) or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
+            url_img = _extract_image_url(item) or "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
-            url = getattr(it, "detail_page_url", None)
+            url = getattr(item, "detail_page_url", None)
             if not url:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
 
@@ -565,11 +388,6 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
 
 def invia_offerta():
-    if _in_cooldown():
-        until = _cooldown_until()
-        print(f"⏳ In cooldown fino a {until.isoformat()} UTC: skip.")
-        return False
-
     if bot is None:
         print("❌ TELEGRAM_BOT_TOKEN mancante.")
         return False

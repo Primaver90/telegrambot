@@ -62,21 +62,34 @@ SEARCH_INDEX = "All"
 ITEMS_PER_PAGE = 8
 PAGES = 4
 
-# >>> FIX: RESOURCES MINIMI E VALIDI per SearchItems
-# Niente "Offers.Listings.Savings" perché non è un resource separato.
-RESOURCES = [
+# Risorse per GetItems (fallback quando SearchItems non include offers/price)
+GETITEMS_RESOURCES = [
     "ItemInfo.Title",
     "Images.Primary.Large",
     "Offers.Listings.Price",
-    "Offers.Listings.Availability.Message",
 ]
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+
+# =========================
+# INIT
+# =========================
+app = Flask(__name__)
+
+if not AMAZON_ACCESS_KEY or not AMAZON_SECRET_KEY:
+    raise RuntimeError("Mancano AMAZON_ACCESS_KEY / AMAZON_SECRET_KEY (env vars).")
+
 amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, AMAZON_COUNTRY)
 
+bot = None
+if TELEGRAM_BOT_TOKEN:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
+
+# =========================
+# HELPERS
+# =========================
 def parse_eur_amount(display_amount: str):
-    """Gestisce anche 1.299,00 € -> 1299.00"""
+    """Supporta anche: 1.299,00 € -> 1299.00"""
     if not display_amount:
         return None
     s = str(display_amount)
@@ -206,21 +219,51 @@ def pick_keyword():
     return kw
 
 
+def _get_item_with_price_by_asin(asin: str):
+    """
+    Fallback: quando SearchItems non include offers/price.
+    Proviamo diverse firme perché amazon_paapi cambia tra versioni.
+    """
+    if not asin:
+        return None
+
+    # 1) get_items(item_ids=[...], resources=[...])
+    try:
+        r = amazon.get_items(item_ids=[asin], resources=GETITEMS_RESOURCES)
+        items = getattr(r, "items", None) or []
+        return items[0] if items else None
+    except Exception as e1:
+        # 2) get_items(item_ids=[...]) senza resources
+        try:
+            r = amazon.get_items(item_ids=[asin])
+            items = getattr(r, "items", None) or []
+            return items[0] if items else None
+        except Exception as e2:
+            # 3) alcune versioni accettano asin singolo
+            try:
+                r = amazon.get_items(asin)
+                items = getattr(r, "items", None) or []
+                return items[0] if items else None
+            except Exception as e3:
+                print(f"❌ GetItems fallito asin={asin}: {repr(e1)} | {repr(e2)} | {repr(e3)}")
+                return None
+
+
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
 
     for page in range(1, PAGES + 1):
+        # SearchItems "come prima" (senza resources) per evitare MalformedRequest()
         try:
             results = amazon.search_items(
                 keywords=kw,
                 item_count=ITEMS_PER_PAGE,
                 search_index=SEARCH_INDEX,
                 item_page=page,
-                resources=RESOURCES,  # <<< FIX qui
             )
             items = getattr(results, "items", []) or []
         except Exception as e:
-            print(f"❌ ERRORE Amazon PA-API (kw='{kw}', page={page}): {repr(e)}")
+            print(f"❌ ERRORE Amazon PA-API SearchItems (kw='{kw}', page={page}): {repr(e)}")
             reasons["paapi_error"] += 1
             items = []
 
@@ -241,6 +284,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["dup_24h"] += 1
                 continue
 
+            # titolo
             title = getattr(
                 getattr(getattr(item, "item_info", None), "title", None),
                 "display_value",
@@ -248,30 +292,58 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             ) or ""
             title = " ".join(title.split())
 
-            offers = getattr(item, "offers", None)
-            listings = getattr(offers, "listings", None) or []
-            if not listings:
-                reasons["no_listings"] += 1
-                continue
+            # prova prezzo da SearchItems
+            listing = None
+            try:
+                listing = getattr(getattr(item, "offers", None), "listings", [None])[0]
+            except Exception:
+                listing = None
 
-            listing = listings[0]
-            price_obj = getattr(listing, "price", None)
+            price_obj = getattr(listing, "price", None) if listing else None
+
+            # fallback GetItems se manca price
+            item_for_images = item
             if not price_obj:
                 reasons["no_price_obj"] += 1
-                continue
 
-            raw_amount = str(getattr(price_obj, "display_amount", ""))
-            price_val = parse_eur_amount(raw_amount)
+                full_item = _get_item_with_price_by_asin(asin)
+                if not full_item:
+                    reasons["getitems_failed"] += 1
+                    continue
+
+                try:
+                    listing = getattr(getattr(full_item, "offers", None), "listings", [None])[0]
+                except Exception:
+                    listing = None
+
+                price_obj = getattr(listing, "price", None) if listing else None
+                if not price_obj:
+                    reasons["getitems_no_price"] += 1
+                    continue
+
+                # prendi titolo migliore se disponibile
+                title2 = getattr(
+                    getattr(getattr(full_item, "item_info", None), "title", None),
+                    "display_value",
+                    "",
+                ) or ""
+                title2 = " ".join(title2.split())
+                if title2:
+                    title = title2
+
+                item_for_images = full_item
+
+            # parsing prezzo
+            price_val = parse_eur_amount(getattr(price_obj, "display_amount", ""))
             if price_val is None:
                 reasons["bad_price_parse"] += 1
-                if DEBUG_FILTERS:
-                    print(f"[DEBUG] parse KO display_amount='{raw_amount}'")
                 continue
 
             if price_val < MIN_PRICE or price_val > MAX_PRICE:
                 reasons["price_out_range"] += 1
                 continue
 
+            # sconti
             savings = getattr(price_obj, "savings", None)
             disc = int(getattr(savings, "percentage", 0) or 0)
 
@@ -290,9 +362,10 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     reasons["disc_too_low"] += 1
                     continue
 
+            # immagine
             url_img = getattr(
                 getattr(
-                    getattr(getattr(item, "images", None), "primary", None),
+                    getattr(getattr(item_for_images, "images", None), "primary", None),
                     "large",
                     None,
                 ),
@@ -303,14 +376,15 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["no_img"] += 1
                 url_img = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
 
+            # url
             url = getattr(item, "detail_page_url", None)
-            if not url and asin:
+            if not url:
                 url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
 
             minimo = disc >= 30
 
             if DEBUG_FILTERS:
-                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} listings={len(listings)}")
+                print(f"[DEBUG] ✅ scelto asin={asin} price={price_val} disc={disc} (fallback={'Y' if item_for_images is not item else 'N'})")
 
             return {
                 "asin": asin,
@@ -332,11 +406,14 @@ def invia_offerta():
     if bot is None:
         print("❌ TELEGRAM_BOT_TOKEN mancante.")
         return False
+    if not TELEGRAM_CHAT_ID:
+        print("❌ TELEGRAM_CHAT_ID mancante.")
+        return False
 
     pubblicati = load_pubblicati()
     kw = pick_keyword()
-    payload = _first_valid_item_for_keyword(kw, pubblicati)
 
+    payload = _first_valid_item_for_keyword(kw, pubblicati)
     if not payload:
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
@@ -366,10 +443,15 @@ def invia_offerta():
     if minimo and sconto >= 30:
         caption_parts.append("❗️🚨 <b>MINIMO STORICO</b> 🚨❗️")
 
-    caption_parts.append(
-        f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
-        f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
-    )
+    # se non abbiamo disc/old coerenti, evita testo brutto
+    if sconto > 0 and prezzo_vecchio_val > prezzo_nuovo_val:
+        caption_parts.append(
+            f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b> invece di "
+            f"<s>{prezzo_vecchio_val:.2f}€</s> (<b>-{sconto}%</b>)"
+        )
+    else:
+        caption_parts.append(f"💶 Prezzo attuale: <b>{prezzo_nuovo_val:.2f}€</b>")
+
     caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
     caption = "\n\n".join(caption_parts)
 
@@ -392,7 +474,6 @@ def invia_offerta():
 def is_in_italy_window(now_utc=None):
     if now_utc is None:
         now_utc = datetime.utcnow()
-
     month = now_utc.month
     offset_hours = 2 if 4 <= month <= 10 else 1
     italy_time = now_utc + timedelta(hours=offset_hours)
@@ -409,15 +490,36 @@ def run_if_in_fascia_oraria():
         print(f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata.")
 
 
-def start_scheduler():
-    schedule.clear()
-    schedule.every().monday.at("06:59").do(resetta_pubblicati)
-    schedule.every(14).minutes.do(run_if_in_fascia_oraria)
-    while True:
-        schedule.run_pending()
-        time.sleep(5)
+def start_scheduler_background():
+    def _loop():
+        schedule.clear()
+        schedule.every().monday.at("06:59").do(resetta_pubblicati)
+        schedule.every(14).minutes.do(run_if_in_fascia_oraria)
+        while True:
+            schedule.run_pending()
+            time.sleep(5)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 
-if __name__ == "__main__":
-    print("🚀 Bot avviato")
-    start_scheduler()
+# =========================
+# FLASK ROUTES
+# =========================
+@app.route("/health", methods=["GET", "HEAD"])
+def health():
+    return ("ok", 200)
+
+
+@app.route("/run", methods=["GET"])
+def run_once():
+    try:
+        ok = invia_offerta()
+        return jsonify({"ok": bool(ok)}), 200
+    except Exception as e:
+        print(f"❌ Errore /run: {repr(e)}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# Avvia lo scheduler in background appena il modulo viene caricato da gunicorn
+start_scheduler_background()

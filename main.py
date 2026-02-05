@@ -196,6 +196,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
         for item in items:
             asin = (getattr(item, "asin", None) or "").strip().upper()
             if not asin or asin in pubblicati or not can_post(asin, hours=24):
+                continue
 
             title = getattr(
                 getattr(getattr(item, "item_info", None), "title", None),

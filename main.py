@@ -100,20 +100,20 @@ def _default_token_url(marketplace: str) -> str:
 TOKEN_URL = _default_token_url(CREATORS_MARKETPLACE)
 
 
-# Resources "safe" (minime) per titolo + immagine + prezzi/sconti
-# Evitiamo savingBasis perché spesso è la prima a far scattare la validation.
+# Resources:
+# - searchItems ha un set consentito più ristretto (no offersV2.summaries.*)
+# - getItems può includere i summaries per calcolare sconti
 SEARCH_RESOURCES = [
     "itemInfo.title",
     "images.primary.large",
     "offersV2.listings.price",
-    "offersV2.summaries.lowestPrice",
-    "offersV2.summaries.savings",
 ]
 
 GETITEMS_RESOURCES = [
     "itemInfo.title",
     "images.primary.large",
     "offersV2.listings.price",
+    "offersV2.listings.savingBasis",
     "offersV2.summaries.lowestPrice",
     "offersV2.summaries.savings",
 ]
@@ -140,13 +140,24 @@ def get_access_token() -> str:
     if DEBUG_AMAZON:
         print(f"[DEBUG] Token refresh -> {TOKEN_URL}")
 
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": _basic_auth_header(CREATORS_CREDENTIAL_ID, CREATORS_CREDENTIAL_SECRET),
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "grant_type": "client_credentials",
+        "client_id": CREATORS_CREDENTIAL_ID,
+        "client_secret": CREATORS_CREDENTIAL_SECRET,
+        "scope": "creatorsapi/default",
     }
-    data = "grant_type=client_credentials&scope=creatorsapi/default"
 
     r = requests.post(TOKEN_URL, headers=headers, data=data, timeout=20)
+    if r.status_code in (400, 401):
+        # fallback: alcune regioni accettano Basic Auth
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": _basic_auth_header(CREATORS_CREDENTIAL_ID, CREATORS_CREDENTIAL_SECRET),
+        }
+        data = "grant_type=client_credentials&scope=creatorsapi/default"
+        r = requests.post(TOKEN_URL, headers=headers, data=data, timeout=20)
+
     if r.status_code != 200:
         raise RuntimeError(f"Token error {r.status_code}: {r.text}")
 
@@ -357,11 +368,33 @@ def creators_search_items(kw: str, page: int):
 def creators_get_items(asins):
     payload = {
         "itemIds": asins,
+        "itemIdType": "ASIN",
         "partnerTag": AMAZON_ASSOCIATE_TAG,
         "marketplace": CREATORS_MARKETPLACE,
         "resources": GETITEMS_RESOURCES,
     }
     return creators_post("/getItems", payload)
+
+
+def _extract_items_list_from_search_response(data: dict):
+    items = data.get("items")
+    if isinstance(items, list):
+        return items
+    items = (data.get("searchResult") or {}).get("items")
+    if isinstance(items, list):
+        return items
+    return []
+
+
+def _extract_items_list_from_getitems_response(data: dict):
+    items = data.get("items")
+    if isinstance(items, list):
+        return items
+    for key in ("getItemsResult", "itemsResult"):
+        items = (data.get(key) or {}).get("items")
+        if isinstance(items, list):
+            return items
+    return []
 
 
 # =========================
@@ -482,8 +515,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     for page in range(1, PAGES + 1):
         try:
             data = creators_search_items(kw, page)
-            search_result = data.get("searchResult") or {}
-            items = search_result.get("items") or []
+            items = _extract_items_list_from_search_response(data)
 
             if DEBUG_AMAZON:
                 print(f"[DEBUG] kw={kw} page={page} items={len(items)}")
@@ -509,8 +541,10 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["already_posted"] += 1
                 continue
 
-            if extracted["price_new"] is None:
-                reasons["no_price_in_searchitems"] += 1
+            # searchItems spesso non restituisce sconto/savings:
+            # manda a getItems per avere dati completi
+            if extracted["price_new"] is None or (extracted["discount"] or 0) == 0:
+                reasons["needs_getitems"] += 1
                 if len(fallback_asins) < GETITEMS_FALLBACK_MAX:
                     fallback_asins.append(asin)
                 continue
@@ -547,8 +581,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
     if fallback_asins:
         try:
             data = creators_get_items(fallback_asins)
-            result = data.get("getItemsResult") or {}
-            items = result.get("items") or []
+            items = _extract_items_list_from_getitems_response(data)
 
             if DEBUG_AMAZON:
                 print(f"[DEBUG] GetItems fallback asins={fallback_asins} items={len(items)}")
@@ -681,3 +714,4 @@ def start_scheduler():
     while True:
         schedule.run_pending()
         time.sleep(5)
+

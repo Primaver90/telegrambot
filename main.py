@@ -2,7 +2,6 @@ import os
 import time
 import html
 import json
-import threading
 from io import BytesIO
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,27 +18,23 @@ from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-AMAZON_ASSOCIATE_TAG = os.environ.get("AMAZON_ASSOCIATE_TAG", "").strip()  # es: itech00-21
+AMAZON_ASSOCIATE_TAG = os.environ.get("AMAZON_ASSOCIATE_TAG", "").strip()
 CREATORS_CREDENTIAL_ID = os.environ.get("CREATORS_CREDENTIAL_ID", "").strip()
 CREATORS_CREDENTIAL_SECRET = os.environ.get("CREATORS_CREDENTIAL_SECRET", "").strip()
-CREATORS_CREDENTIAL_VERSION = os.environ.get("CREATORS_CREDENTIAL_VERSION", "").strip()  # es: 2
+CREATORS_CREDENTIAL_VERSION = os.environ.get("CREATORS_CREDENTIAL_VERSION", "").strip()
 CREATORS_MARKETPLACE = os.environ.get("CREATORS_MARKETPLACE", "www.amazon.it").strip()
 
-# Debug
 DEBUG_AMAZON = os.environ.get("DEBUG_AMAZON", "0") == "1"
 GETITEMS_FALLBACK_MAX = int(os.environ.get("GETITEMS_FALLBACK_MAX", "4"))
 
-# Filtri offerta
 MIN_DISCOUNT = int(os.environ.get("MIN_DISCOUNT", "15"))
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "15"))
 MAX_PRICE = float(os.environ.get("MAX_PRICE", "1900"))
 
-# Assets
 FONT_PATH = os.environ.get("FONT_PATH", "Montserrat-VariableFont_wght.ttf")
 LOGO_PATH = os.environ.get("LOGO_PATH", "header_clean2.png")
 BADGE_PATH = os.environ.get("BADGE_PATH", "minimo storico flat.png")
 
-# Storage
 DATA_DIR = "/tmp/botdata"
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 PUB_FILE = os.path.join(DATA_DIR, "pubblicati.txt")
@@ -47,26 +42,11 @@ PUB_TS = os.path.join(DATA_DIR, "pubblicati_ts.csv")
 KW_INDEX = os.path.join(DATA_DIR, "kw_index.txt")
 
 KEYWORDS = [
-    "Apple",
-    "Android",
-    "iPhone",
-    "MacBook",
-    "tablet",
-    "smartwatch",
-    "auricolari Bluetooth",
-    "smart TV",
-    "monitor PC",
-    "notebook",
-    "gaming mouse",
-    "gaming tastiera",
-    "console",
-    "soundbar",
-    "smart home",
-    "aspirapolvere robot",
-    "telecamere WiFi",
-    "caricatore wireless",
-    "accessori smartphone",
-    "accessori iPhone",
+    "Apple", "Android", "iPhone", "MacBook", "tablet", "smartwatch",
+    "auricolari Bluetooth", "smart TV", "monitor PC", "notebook",
+    "gaming mouse", "gaming tastiera", "console", "soundbar", "smart home",
+    "aspirapolvere robot", "telecamere WiFi", "caricatore wireless",
+    "accessori smartphone", "accessori iPhone",
 ]
 
 ITEMS_PER_PAGE = 8
@@ -74,19 +54,45 @@ PAGES = 4
 
 # Creators API
 CREATORS_API_BASE = "https://creatorsapi.amazon"
-TOKEN_ENDPOINT_EU_V2 = "https://creatorsapi.auth.eu-south-2.amazoncognito.com/oauth2/token"
+TOKEN_ENDPOINT = "https://creatorsapi.auth.eu-south-2.amazoncognito.com/oauth2/token"
 SCOPE = "creatorsapi/default"
 
-# Resources (a livelli) – l’API a volte rifiuta certi set, quindi degradiamo.
-# NOTA: qui usiamo naming come nei tuoi log: images.primary.large, itemInfo.title, offersV2...
-RES_L1 = ["images.primary.large", "itemInfo.title", "offersV2.listings.price", "offersV2.listings.savingBasis"]
-RES_L2 = ["images.primary.large", "itemInfo.title", "offersV2.listings.price"]
-RES_L3 = ["images.primary.large", "itemInfo.title"]
-RESOURCE_LEVELS_SEARCH = [RES_L1, RES_L2, RES_L3]
+# ✅ Resources: niente savingBasis in SearchItems L1 (ti fa 400), usiamo summaries per lo sconto
+RES_L1 = [
+    "images.primary.large",
+    "itemInfo.title",
+    "offersV2.listings.price",
+    "offersV2.summaries.savings",
+    "offersV2.summaries.lowestPrice",
+]
+RES_L2 = [
+    "images.primary.large",
+    "itemInfo.title",
+    "offersV2.listings.price",
+    "offersV2.summaries.lowestPrice",
+]
+RES_L3 = [
+    "images.primary.large",
+    "itemInfo.title",
+    "offersV2.listings.price",
+]
+RES_L4 = [
+    "images.primary.large",
+    "itemInfo.title",
+]
+RESOURCE_LEVELS_SEARCH = [RES_L1, RES_L2, RES_L3, RES_L4]
 
-RES_GETITEMS = ["images.primary.large", "itemInfo.title", "offersV2.listings.price", "offersV2.listings.savingBasis"]
+# GetItems può essere più ricco (spesso accetta savingBasis, ma se non lo accetta non muore)
+RES_GETITEMS = [
+    "images.primary.large",
+    "itemInfo.title",
+    "offersV2.listings.price",
+    "offersV2.summaries.savings",
+    "offersV2.summaries.lowestPrice",
+    # tentiamo anche savingBasis ma se rifiuta gestiamo
+    "offersV2.listings.savingBasis",
+]
 
-# Telegram
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 
 # =========================
@@ -94,22 +100,14 @@ bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 # =========================
 def _assert_env():
     missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing.append("TELEGRAM_CHAT_ID")
-    if not AMAZON_ASSOCIATE_TAG:
-        missing.append("AMAZON_ASSOCIATE_TAG")
-    if not CREATORS_CREDENTIAL_ID:
-        missing.append("CREATORS_CREDENTIAL_ID")
-    if not CREATORS_CREDENTIAL_SECRET:
-        missing.append("CREATORS_CREDENTIAL_SECRET")
-    if not CREATORS_CREDENTIAL_VERSION:
-        missing.append("CREATORS_CREDENTIAL_VERSION")
-
+    if not TELEGRAM_BOT_TOKEN: missing.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if not AMAZON_ASSOCIATE_TAG: missing.append("AMAZON_ASSOCIATE_TAG")
+    if not CREATORS_CREDENTIAL_ID: missing.append("CREATORS_CREDENTIAL_ID")
+    if not CREATORS_CREDENTIAL_SECRET: missing.append("CREATORS_CREDENTIAL_SECRET")
+    if not CREATORS_CREDENTIAL_VERSION: missing.append("CREATORS_CREDENTIAL_VERSION")
     if missing:
         raise RuntimeError(f"Env var mancanti: {', '.join(missing)}")
-
 
 # =========================
 # TOKEN CACHE
@@ -117,9 +115,6 @@ def _assert_env():
 _token_cache = {"access_token": None, "expires_at": 0}
 
 def _get_access_token():
-    """
-    OAuth 2.0 (client_credentials) come da PDF: client_id e client_secret nel body.
-    """
     now = int(time.time())
     if _token_cache["access_token"] and now < (_token_cache["expires_at"] - 60):
         return _token_cache["access_token"]
@@ -130,14 +125,12 @@ def _get_access_token():
         "client_secret": CREATORS_CREDENTIAL_SECRET,
         "scope": SCOPE,
     }
-
     r = requests.post(
-        TOKEN_ENDPOINT_EU_V2,
+        TOKEN_ENDPOINT,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         data=data,
         timeout=20,
     )
-
     if r.status_code != 200:
         raise RuntimeError(f"Token error {r.status_code}: {r.text}")
 
@@ -151,10 +144,9 @@ def _get_access_token():
     _token_cache["expires_at"] = int(time.time()) + expires_in
 
     if DEBUG_AMAZON:
-        print(f"[DEBUG] Token OK (expires_in={expires_in}s) url={TOKEN_ENDPOINT_EU_V2}")
+        print(f"[DEBUG] Token OK (expires_in={expires_in}s) url={TOKEN_ENDPOINT}")
 
     return token
-
 
 def _creators_headers():
     token = _get_access_token()
@@ -164,103 +156,28 @@ def _creators_headers():
         "x-marketplace": CREATORS_MARKETPLACE,
     }
 
-
 def _creators_post(path, body):
     url = f"{CREATORS_API_BASE}{path}"
-    h = _creators_headers()
-    r = requests.post(url, headers=h, data=json.dumps(body), timeout=25)
+    r = requests.post(url, headers=_creators_headers(), data=json.dumps(body), timeout=25)
     return r
 
-
 # =========================
-# PARSING HELPERS
+# HELPERS
 # =========================
-def _parse_eur_from_display_amount(s):
-    """
-    Gestisce "249,0 €", "249,00€", "1.299,00" ecc.
-    """
-    if not s:
-        return None
-    txt = str(s).replace("€", "").replace("\xa0", " ").strip()
-    # "1.299,00" -> "1299.00"
-    txt = txt.replace(".", "").replace(",", ".").strip()
-    try:
-        return float(txt)
-    except:
-        return None
-
-
-def _extract_price_and_old(item):
-    """
-    Legge Creators API dict:
-      offersV2: { listings: [ { price: { money: {amount}, displayAmount }, savingBasis: {...} } ] }
-    """
-    offers = item.get("offersV2") or {}
-    listings = offers.get("listings") or []
-    if not listings:
-        return (None, None, None)
-
-    l0 = listings[0] or {}
-
-    price = l0.get("price") or {}
-    price_amount = None
-
-    # 1) money.amount (migliore)
-    money = price.get("money") or {}
-    if isinstance(money, dict):
-        price_amount = money.get("amount")
-
-    # 2) displayAmount fallback
-    if price_amount is None:
-        price_amount = _parse_eur_from_display_amount(price.get("displayAmount"))
-
-    # savingBasis (prezzo “vecchio”)
-    saving_basis = l0.get("savingBasis") or {}
-    old_amount = None
-    old_money = saving_basis.get("money") or {}
-    if isinstance(old_money, dict):
-        old_amount = old_money.get("amount")
-    if old_amount is None:
-        old_amount = _parse_eur_from_display_amount(saving_basis.get("displayAmount"))
-
-    # se non ho old_amount, lo metto uguale al nuovo (niente sconto calcolabile)
-    if price_amount is None:
-        return (None, None, None)
-
-    if old_amount is None:
-        old_amount = float(price_amount)
-
-    # calcolo sconto %
-    try:
-        if old_amount > 0 and old_amount >= price_amount:
-            disc = int(round((1.0 - (float(price_amount) / float(old_amount))) * 100))
-        else:
-            disc = 0
-    except:
-        disc = 0
-
-    return (float(price_amount), disc, float(old_amount))
-
-
 def _extract_title(item):
-    # itemInfo.title.displayValue
     info = item.get("itemInfo") or {}
     title_obj = info.get("title") or {}
     t = title_obj.get("displayValue") or ""
     return " ".join(str(t).split())
 
-
 def _extract_image(item):
-    # images.primary.large.url
     images = item.get("images") or {}
     primary = images.get("primary") or {}
     large = primary.get("large") or {}
     url = large.get("url")
     if not url:
-        # fallback brutale
         url = "https://m.media-amazon.com/images/I/71bhWgQK-cL._AC_SL1500_.jpg"
     return url
-
 
 def _extract_detail_url(item, asin):
     url = item.get("detailPageURL")
@@ -270,16 +187,92 @@ def _extract_detail_url(item, asin):
         return f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
     return "https://www.amazon.it"
 
+def _money_amount(obj):
+    """Ritorna float se trova money.amount oppure displayAmount convertibile."""
+    if not obj:
+        return None
+    money = obj.get("money")
+    if isinstance(money, dict) and money.get("amount") is not None:
+        try:
+            return float(money["amount"])
+        except:
+            pass
+    disp = obj.get("displayAmount")
+    if disp:
+        s = str(disp).replace("€", "").replace("\xa0", " ").strip()
+        s = s.replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except:
+            return None
+    return None
+
+def _extract_price_old_disc(item):
+    """
+    Prezzo nuovo: offersV2.listings[0].price
+    Sconto: preferisci offersV2.summaries[0].savings.percentage
+    Old price:
+      - se savingBasis disponibile => quello
+      - altrimenti prova summaries[0].lowestPrice come base (quando sensato)
+      - altrimenti old = new
+    """
+    offers = item.get("offersV2") or {}
+    listings = offers.get("listings") or []
+    l0 = listings[0] if listings else None
+
+    price_new = None
+    if l0:
+        price_new = _money_amount(l0.get("price") or {})
+
+    # summaries
+    summaries = offers.get("summaries") or []
+    s0 = summaries[0] if summaries else {}
+
+    # 1) sconto diretto
+    disc = 0
+    savings = s0.get("savings") or {}
+    perc = savings.get("percentage")
+    if perc is not None:
+        try:
+            disc = int(perc)
+        except:
+            disc = 0
+
+    # 2) old price: savingBasis se presente
+    old_price = None
+    if l0:
+        old_price = _money_amount(l0.get("savingBasis") or {})
+
+    # 3) old price: lowestPrice (se maggiore del new)
+    if old_price is None:
+        lp = _money_amount(s0.get("lowestPrice") or {})
+        if price_new is not None and lp is not None and lp >= price_new:
+            old_price = lp
+
+    # fallback old=new
+    if price_new is None:
+        return None, None, None
+
+    if old_price is None:
+        old_price = float(price_new)
+
+    # se disc non c’è ma ho old/new, calcolo io
+    if disc == 0 and old_price and old_price > 0 and old_price >= price_new:
+        try:
+            disc = int(round((1 - (float(price_new) / float(old_price))) * 100))
+        except:
+            disc = 0
+
+    return float(price_new), int(disc), float(old_price)
 
 # =========================
-# IMAGE GENERATION
+# IMAGE
 # =========================
 def draw_bold_text(draw, position, text, font, fill="black", offset=1):
     x, y = position
     for dx in (-offset, 0, offset):
         for dy in (-offset, 0, offset):
             draw.text((x + dx, y + dy), text, font=font, fill=fill)
-
 
 def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_img, minimo_storico):
     img = Image.new("RGB", (1080, 1080), "white")
@@ -319,16 +312,14 @@ def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_im
     output.seek(0)
     return output
 
-
 # =========================
-# PERSISTENCE: PUBLISHED
+# PUBLISHED
 # =========================
 def load_pubblicati():
     if not os.path.exists(PUB_FILE):
         return set()
     with open(PUB_FILE, "r", encoding="utf-8") as f:
         return {line.strip().upper() for line in f if line.strip()}
-
 
 def save_pubblicati(asin):
     asin = (asin or "").strip().upper()
@@ -338,7 +329,6 @@ def save_pubblicati(asin):
         f.write(asin + "\n")
         f.flush()
         os.fsync(f.fileno())
-
 
 def can_post(asin, hours=24):
     if not os.path.exists(PUB_TS):
@@ -358,18 +348,15 @@ def can_post(asin, hours=24):
                     pass
     return True
 
-
 def mark_posted(asin):
     with open(PUB_TS, "a", encoding="utf-8") as f:
         f.write(f"{asin};{datetime.utcnow().isoformat()}\n")
         f.flush()
         os.fsync(f.fileno())
 
-
 def resetta_pubblicati():
     open(PUB_FILE, "w", encoding="utf-8").close()
     open(PUB_TS, "w", encoding="utf-8").close()
-
 
 # =========================
 # KEYWORD ROTATION
@@ -382,13 +369,11 @@ def get_kw_index():
         i = 0
     return i % len(KEYWORDS)
 
-
 def bump_kw_index():
     i = get_kw_index()
     i = (i + 1) % len(KEYWORDS)
     with open(KW_INDEX, "w", encoding="utf-8") as f:
         f.write(str(i))
-
 
 def pick_keyword():
     i = get_kw_index()
@@ -396,9 +381,8 @@ def pick_keyword():
     bump_kw_index()
     return kw
 
-
 # =========================
-# CREATORS API CALLS
+# API CALLS
 # =========================
 def creators_search_items(kw, page, resources):
     body = {
@@ -409,9 +393,7 @@ def creators_search_items(kw, page, resources):
         "page": page,
         "itemCount": ITEMS_PER_PAGE,
     }
-    r = _creators_post("/catalog/v1/searchItems", body)
-    return r
-
+    return _creators_post("/catalog/v1/searchItems", body)
 
 def creators_get_items(asins, resources):
     body = {
@@ -420,16 +402,7 @@ def creators_get_items(asins, resources):
         "marketplace": CREATORS_MARKETPLACE,
         "resources": resources,
     }
-    r = _creators_post("/catalog/v1/getItems", body)
-    return r
-
-
-def _api_error_text(resp):
-    try:
-        return resp.text
-    except:
-        return "<no text>"
-
+    return _creators_post("/catalog/v1/getItems", body)
 
 def _json_or_none(resp):
     try:
@@ -437,9 +410,8 @@ def _json_or_none(resp):
     except:
         return None
 
-
 # =========================
-# CORE: FIND FIRST VALID ITEM
+# CORE
 # =========================
 def _first_valid_item_for_keyword(kw, pubblicati):
     reasons = Counter()
@@ -447,10 +419,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
 
     for page in range(1, PAGES + 1):
         items = []
-
-        # Prova resources a livelli (per evitare errori "resources rejected")
         used_resources = None
-        last_err = None
+
         for lvl, res in enumerate(RESOURCE_LEVELS_SEARCH, start=1):
             if DEBUG_AMAZON:
                 print(f"[DEBUG] SearchItems try L{lvl} resources={res}")
@@ -458,34 +428,23 @@ def _first_valid_item_for_keyword(kw, pubblicati):
             resp = creators_search_items(kw, page, res)
             if resp.status_code == 200:
                 data = _json_or_none(resp) or {}
-                # compatibilità: alcuni response hanno searchResult, altri items direttamente
                 sr = data.get("searchResult") or data
                 items = sr.get("items") or []
                 used_resources = res
                 if DEBUG_AMAZON:
-                    keys = list(sr.keys()) if isinstance(sr, dict) else []
                     print(f"[DEBUG] kw={kw} page={page} items={len(items)} used_resources={used_resources}")
-                    if keys:
-                        print(f"[DEBUG] searchItems raw keys: {keys[:10]}")
+                    print(f"[DEBUG] searchItems raw keys: {list(sr.keys()) if isinstance(sr, dict) else []}")
                 break
-
-            # Se 400: spesso è resources invalid -> degrada
-            last_err = _api_error_text(resp)
-            if DEBUG_AMAZON:
-                print(f"[DEBUG] SearchItems L{lvl} rejected ({resp.status_code}) -> {last_err[:240]}")
-            reasons["paapi_error"] += 1
-            continue
+            else:
+                if DEBUG_AMAZON:
+                    print(f"[DEBUG] SearchItems L{lvl} rejected ({resp.status_code}) -> {resp.text[:240]}")
+                reasons["api_error"] += 1
 
         if used_resources is None:
-            # nessun livello ha funzionato
-            if DEBUG_AMAZON and last_err:
-                print(f"[DEBUG] SearchItems failed all levels kw={kw} page={page}: {last_err[:400]}")
             continue
 
-        # Debug preview (solo primo item)
         if DEBUG_AMAZON and items:
-            preview = {"asin": items[0].get("asin"), "detailPageURL": items[0].get("detailPageURL")}
-            print(f"[DEBUG] searchItems raw preview: {json.dumps(preview, ensure_ascii=False)[:300]}")
+            print(f"[DEBUG] searchItems raw preview: {json.dumps({'asin': items[0].get('asin'), 'detailPageURL': items[0].get('detailPageURL')}, ensure_ascii=False)}")
 
         for item in items:
             asin = (item.get("asin") or "").strip().upper()
@@ -496,20 +455,15 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["already_posted"] += 1
                 continue
 
-            # MAP? (se presente e True, spesso niente prezzi reali)
-            if (item.get("offersV2") or {}).get("violatesMAP") is True:
-                reasons["violates_map"] += 1
-                continue
-
             title = _extract_title(item)
             url_img = _extract_image(item)
             url = _extract_detail_url(item, asin)
 
-            price_new, disc, price_old = _extract_price_and_old(item)
-
+            price_new, disc, price_old = _extract_price_old_disc(item)
             has_offers = bool((item.get("offersV2") or {}).get("listings"))
+
             if price_new is None:
-                reasons["no_price_in_searchitems"] += 1
+                reasons["no_price"] += 1
                 if DEBUG_AMAZON:
                     print(f"[DEBUG] asin={asin} no_price | has_offers={has_offers}")
                 if len(fallback_asins) < GETITEMS_FALLBACK_MAX:
@@ -528,30 +482,35 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 continue
 
             minimo = disc >= 30
-
             return {
                 "asin": asin,
                 "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
                 "price_new": float(price_new),
-                "price_old": float(price_old) if price_old is not None else float(price_new),
+                "price_old": float(price_old),
                 "discount": int(disc),
                 "url_img": url_img,
                 "url": url,
                 "minimo": minimo,
             }
 
-    # Fallback: GetItems su pochi ASIN per cercare prezzi
+    # Fallback GetItems (se serve)
     if fallback_asins:
         if DEBUG_AMAZON:
             print(f"[DEBUG] GetItems fallback asins={fallback_asins}")
 
-        resp = creators_get_items(fallback_asins, RES_GETITEMS)
-        if resp.status_code == 200:
+        # tentiamo 2 volte: prima con RES_GETITEMS completo, poi senza savingBasis se rifiuta
+        for attempt, res in enumerate([RES_GETITEMS, [r for r in RES_GETITEMS if r != "offersV2.listings.savingBasis"]], start=1):
+            resp = creators_get_items(fallback_asins, res)
+            if resp.status_code != 200:
+                if DEBUG_AMAZON:
+                    print(f"[DEBUG] GetItems attempt {attempt} error {resp.status_code}: {resp.text[:240]}")
+                continue
+
             data = _json_or_none(resp) or {}
             ir = data.get("itemsResult") or data
             items = ir.get("items") or []
             if DEBUG_AMAZON:
-                print(f"[DEBUG] GetItems items={len(items)}")
+                print(f"[DEBUG] GetItems attempt {attempt} items={len(items)} used_resources={res}")
 
             for item in items:
                 asin = (item.get("asin") or "").strip().upper()
@@ -562,42 +521,33 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 url_img = _extract_image(item)
                 url = _extract_detail_url(item, asin)
 
-                price_new, disc, price_old = _extract_price_and_old(item)
+                price_new, disc, price_old = _extract_price_old_disc(item)
                 if price_new is None:
                     continue
-
                 if price_new < MIN_PRICE or price_new > MAX_PRICE:
                     continue
                 if disc < MIN_DISCOUNT:
                     continue
 
                 minimo = disc >= 30
-                if DEBUG_AMAZON:
-                    print(f"[DEBUG] FOUND via GetItems asin={asin} price={price_new} old={price_old} disc={disc}")
-
                 return {
                     "asin": asin,
                     "title": title[:80].strip() + ("…" if len(title) > 80 else ""),
                     "price_new": float(price_new),
-                    "price_old": float(price_old) if price_old is not None else float(price_new),
+                    "price_old": float(price_old),
                     "discount": int(disc),
                     "url_img": url_img,
                     "url": url,
                     "minimo": minimo,
                 }
-        else:
-            if DEBUG_AMAZON:
-                print(f"[DEBUG] GetItems error {resp.status_code}: {_api_error_text(resp)[:400]}")
-            reasons["getitems_error"] += 1
 
     if DEBUG_AMAZON:
         print(f"[DEBUG] kw={kw} reasons={dict(reasons)} fallback_asins={fallback_asins}")
 
     return None
 
-
 # =========================
-# SEND OFFER
+# SEND
 # =========================
 def invia_offerta():
     _assert_env()
@@ -652,7 +602,6 @@ def invia_offerta():
     print(f"✅ Pubblicata: {asin} | {kw}")
     return True
 
-
 # =========================
 # TIME WINDOW ITALY
 # =========================
@@ -665,7 +614,6 @@ def is_in_italy_window(now_utc=None):
     in_window = 9 <= italy_time.hour < 21
     return in_window, italy_time
 
-
 def run_if_in_fascia_oraria():
     now_utc = datetime.utcnow()
     in_window, italy_time = is_in_italy_window(now_utc)
@@ -673,7 +621,6 @@ def run_if_in_fascia_oraria():
         invia_offerta()
     else:
         print(f"⏸ Fuori fascia oraria (Italia {italy_time.strftime('%H:%M')}), nessuna offerta pubblicata.")
-
 
 def start_scheduler():
     schedule.clear()

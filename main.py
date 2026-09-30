@@ -742,7 +742,7 @@ def send_payload(payload, chat_id, reply_markup=None):
         minimo,
     )
 
-    safe_title = html.escape(titolo)
+    safe_title = html.escape(payload.get("description") or titolo)
     safe_url = html.escape(url, quote=True)
 
     caption_parts = [f"📌 <b>{safe_title}</b>"]

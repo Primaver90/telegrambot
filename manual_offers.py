@@ -6,13 +6,16 @@ import time
 from urllib.parse import urlparse, urljoin
 
 import requests
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 import main
 
 ADMIN_IDS = {int(v.strip()) for v in os.environ.get('TELEGRAM_ADMIN_IDS', '').split(',') if v.strip()}
 DRAFT_TTL = 600
 _drafts = {}
-HELP = ('Invia un link Amazon.it o /offerta ASIN.\n'
+NEW_OFFER = '➕ Inserisci offerta'
+MENU = ReplyKeyboardMarkup([[NEW_OFFER]], resize_keyboard=True, one_time_keyboard=False)
+HELP = ('Premi ➕ Inserisci offerta e invia il link Amazon del prodotto.\n'
+        'Sotto l’anteprima trovi Pubblica, Modifica testo e Annulla.\n'
         'Poi puoi usare /testo descrizione e /coupon codice o istruzioni.\n'
         'Usa /testo - o /coupon - per cancellarli.\n'
         'Ogni modifica crea una nuova anteprima. Premi Pubblica solo quando è pronta.\n'
@@ -72,10 +75,11 @@ def preview(uid, offer):
     nonce = secrets.token_hex(8)
     draft = dict(payload=offer, nonce=nonce, expires=time.time() + DRAFT_TTL)
     _drafts[uid] = draft
-    buttons = InlineKeyboardMarkup([[
-        InlineKeyboardButton('✅ Pubblica', callback_data='publish:' + nonce),
-        InlineKeyboardButton('❌ Annulla', callback_data='cancel:' + nonce),
-    ]])
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton('✅ Pubblica', callback_data='publish:' + nonce)],
+        [InlineKeyboardButton('✏️ Modifica testo', callback_data='edit:' + nonce),
+         InlineKeyboardButton('❌ Annulla', callback_data='cancel:' + nonce)],
+    ])
     try:
         main.send_payload(offer, uid, reply_markup=buttons)
     except Exception:
@@ -101,22 +105,40 @@ def handle_update(update):
         return
     if query:
         action, _, nonce = (query.data or '').partition(':')
-        if action not in ('publish', 'cancel'):
+        if action not in ('publish', 'edit', 'cancel'):
             return
         draft = _drafts.get(uid)
         if not draft or nonce != draft['nonce'] or time.time() > draft['expires']:
             query.answer('Anteprima scaduta o sostituita. Invia di nuovo il link.', show_alert=True)
             return
+        if action == 'publish' and draft.get('editing'):
+            query.answer('Invia prima il nuovo testo e controlla la nuova anteprima.', show_alert=True)
+            return
         query.answer()
+        if action == 'edit':
+            draft['editing'] = True
+            draft['expires'] = time.time() + DRAFT_TTL
+            offer = draft['payload']
+            current = offer.get('description') or offer['title']
+            if offer.get('note'):
+                current += '\n\n' + offer['note']
+            main.bot.send_message(uid, 'Testo attuale:\n\n' + current)
+            main.bot.send_message(uid, 'Scrivi il nuovo testo descrittivo (massimo 500 caratteri). '
+                                  'Prezzo, coupon e link affiliato restano automatici. '
+                                  'Invia - per ripristinare il titolo Amazon, oppure /annulla per eliminare la bozza.',
+                                  reply_markup=MENU)
+            return
         if action == 'cancel':
             _drafts.pop(uid, None)
-            main.bot.send_message(uid, 'Bozza annullata.')
+            main.bot.send_message(uid, 'Bozza annullata.', reply_markup=MENU)
             return
         # Consuma prima dell'invio: anche un timeout ambiguo non causa un reinvio automatico.
         _drafts.pop(uid, None)
         offer = draft['payload']
         fresh = load_offer(offer['asin'])
         fresh.update(note=offer.get('note', ''), coupon=offer.get('coupon', ''))
+        if offer.get('description'):
+            fresh['description'] = offer['description']
         if any(fresh[k] != offer[k] for k in ('price_new', 'price_old', 'discount', 'title', 'url_img', 'url')):
             main.bot.send_message(uid, 'I dati Amazon sono cambiati: controlla la nuova anteprima e conferma di nuovo.')
             preview(uid, fresh)
@@ -128,16 +150,30 @@ def handle_update(update):
             main.send_payload(fresh, main.TELEGRAM_CHAT_ID)
             main.save_pubblicati(offer['asin'])
             main.mark_posted(offer['asin'])
-        main.bot.send_message(uid, '✅ Offerta pubblicata nel canale.')
+        main.bot.send_message(uid, '✅ Offerta pubblicata nel canale.', reply_markup=MENU)
         return
     command, _, arg = text.partition(' ')
     command = command.split('@', 1)[0].lower()
     arg = arg.strip()
-    if command in ('/start', '/help', '/aiuto'):
-        main.bot.send_message(uid, HELP)
+    draft = _drafts.get(uid)
+    if text == NEW_OFFER or (command == '/offerta' and not arg):
+        _drafts.pop(uid, None)
+        main.bot.send_message(uid, 'Incolla qui il link Amazon del prodotto (oppure il suo ASIN).', reply_markup=MENU)
+    elif command in ('/start', '/help', '/aiuto'):
+        main.bot.send_message(uid, HELP, reply_markup=MENU)
     elif command == '/annulla':
         _drafts.pop(uid, None)
-        main.bot.send_message(uid, 'Bozza annullata.')
+        main.bot.send_message(uid, 'Bozza annullata.', reply_markup=MENU)
+    elif draft and draft.get('editing') and not text.startswith('/'):
+        if time.time() > draft['expires']:
+            _drafts.pop(uid, None)
+            raise ValueError('Anteprima scaduta. Premi ➕ Inserisci offerta per ricominciare.')
+        if not text or len(text.encode('utf-16-le')) // 2 > 500:
+            raise ValueError('Invia un messaggio di testo di massimo 500 caratteri.')
+        offer = dict(draft['payload'])
+        offer['description'] = '' if text == '-' else text
+        offer['note'] = ''
+        preview(uid, offer)
     elif command in ('/testo', '/coupon'):
         draft = _drafts.get(uid)
         if not draft or time.time() > draft['expires']:
@@ -152,7 +188,7 @@ def handle_update(update):
         asin = extract_asin(arg if command == '/offerta' else text)
         preview(uid, load_offer(asin))
     else:
-        main.bot.send_message(uid, HELP)
+        main.bot.send_message(uid, HELP, reply_markup=MENU)
 
 
 def run_polling():

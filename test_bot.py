@@ -150,6 +150,70 @@ class Tests(unittest.TestCase):
     def test_public_run_disabled(self):
         self.assertEqual(app.app.test_client().get('/run').status_code, 403)
 
+    def test_menu_and_new_offer_invalidate_old_preview(self):
+        with patch.object(main, 'bot') as bot, patch.object(main, 'send_payload'), patch.object(manual, 'load_offer') as load:
+            manual.handle_update(update('/start'))
+            menu = bot.send_message.call_args.kwargs['reply_markup']
+            self.assertEqual(menu.keyboard[0][0].text, manual.NEW_OFFER)
+            manual.preview(42, dict(OFFER))
+            nonce = manual._drafts[42]['nonce']
+            manual.handle_update(update(manual.NEW_OFFER))
+            manual.handle_update(update(action='publish:' + nonce))
+            self.assertNotIn(42, manual._drafts)
+            load.assert_not_called()
+
+    def test_edit_then_preview_then_publish_preserves_text(self):
+        with patch.object(main, 'send_payload') as send, patch.object(main, 'bot'), patch.object(manual, 'load_offer', return_value=dict(OFFER)) as load, patch.object(main, 'can_post', return_value=True), patch.object(main, 'save_pubblicati'), patch.object(main, 'mark_posted'):
+            manual.preview(42, dict(OFFER))
+            nonce = manual._drafts[42]['nonce']
+            self.assertTrue(any(b.callback_data == 'edit:' + nonce for row in send.call_args.kwargs['reply_markup'].inline_keyboard for b in row))
+            manual.handle_update(update(action='edit:' + nonce))
+            manual.handle_update(update(action='publish:' + nonce))
+            load.assert_not_called()
+            send.reset_mock()
+            manual.handle_update(update('La mia offerta <speciale>'))
+            self.assertEqual(send.call_args.args[1], 42)
+            new_nonce = manual._drafts[42]['nonce']
+            self.assertNotEqual(new_nonce, nonce)
+            manual.handle_update(update(action='publish:' + nonce))
+            load.assert_not_called()
+            manual.handle_update(update(action='publish:' + new_nonce))
+            self.assertEqual(send.call_args.args[1], main.TELEGRAM_CHAT_ID)
+            self.assertEqual(send.call_args.args[0]['description'], 'La mia offerta <speciale>')
+
+    def test_edit_access_expiry_and_cancel(self):
+        with patch.object(main, 'send_payload') as send, patch.object(main, 'bot'):
+            manual.preview(42, dict(OFFER))
+            nonce = manual._drafts[42]['nonce']
+            manual.handle_update(update(action='edit:' + nonce, uid=7))
+            self.assertFalse(manual._drafts[42].get('editing'))
+            manual.handle_update(update(action='edit:' + nonce))
+            self.assertRaises(ValueError, manual.handle_update, update('😀' * 251))
+            manual._drafts[42]['expires'] = 0
+            self.assertRaises(ValueError, manual.handle_update, update('Nuovo testo'))
+            self.assertNotIn(42, manual._drafts)
+            manual.preview(42, dict(OFFER))
+            nonce = manual._drafts[42]['nonce']
+            manual.handle_update(update(action='edit:' + nonce))
+            manual.handle_update(update(action='cancel:' + nonce))
+            self.assertNotIn(42, manual._drafts)
+
+    def test_custom_text_survives_price_refresh(self):
+        with patch.object(main, 'send_payload'), patch.object(main, 'bot'), patch.object(manual, 'load_offer', return_value=dict(OFFER, price_new=110)):
+            manual.preview(42, dict(OFFER, description='Testo personalizzato'))
+            nonce = manual._drafts[42]['nonce']
+            manual.handle_update(update(action='publish:' + nonce))
+            self.assertEqual(manual._drafts[42]['payload']['description'], 'Testo personalizzato')
+            self.assertEqual(manual._drafts[42]['payload']['price_new'], 110)
+
+    def test_custom_caption_escaped_and_price_link_retained(self):
+        with patch.object(main, 'genera_immagine_offerta', return_value=b'image'), patch.object(main, 'bot') as bot:
+            main.send_payload(dict(OFFER, description='Speciale <b>oggi</b>'), 42)
+            caption = bot.send_photo.call_args.kwargs['caption']
+            self.assertIn('Speciale &lt;b&gt;oggi&lt;/b&gt;', caption)
+            self.assertIn('100.00€', caption)
+            self.assertIn('tag=test-21', caption)
+
 
 if __name__ == '__main__':
     unittest.main()

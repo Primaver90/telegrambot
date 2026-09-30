@@ -1,11 +1,11 @@
 import os
 import time
 import json
-import base64
 import html
 import threading
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from collections import Counter
 
@@ -179,6 +179,7 @@ def genera_immagine_offerta(titolo, prezzo_nuovo, prezzo_vecchio, sconto, url_im
     draw.text((830, 230), f"-{sconto}%", font=font_perc, fill="black")
 
     response = requests.get(url_img, timeout=15)
+    response.raise_for_status()
     prodotto = Image.open(BytesIO(response.content)).resize((600, 600))
     img.paste(prodotto, (240, 230))
 
@@ -286,12 +287,15 @@ _token_expiry_epoch = 0
 
 
 def _build_token_url():
-    if CREATORS_TOKEN_URL:
-        url = CREATORS_TOKEN_URL.strip()
-        if not url.startswith("http"):
-            url = "https://" + url.lstrip("/")
-        return url
-    return f"https://creatorsapi.auth.{CREATORS_AUTH_REGION}.amazoncognito.com/oauth2/token"
+    endpoints = {
+        "3.1": "https://api.amazon.com/auth/o2/token",
+        "3.2": "https://api.amazon.co.uk/auth/o2/token",
+        "3.3": "https://api.amazon.co.jp/auth/o2/token",
+    }
+    if CREATORS_CREDENTIAL_VERSION not in endpoints:
+        raise RuntimeError("Imposta la versione esatta delle nuove credenziali LwA: 3.1, 3.2 o 3.3")
+    # La versione determina l'endpoint; ignora i vecchi override Cognito.
+    return endpoints[CREATORS_CREDENTIAL_VERSION]
 
 
 def _get_access_token():
@@ -304,25 +308,25 @@ def _get_access_token():
             return _access_token
 
         token_url = _build_token_url()
-        basic = base64.b64encode(
-            f"{CREATORS_CREDENTIAL_ID}:{CREATORS_CREDENTIAL_SECRET}".encode("utf-8")
-        ).decode("utf-8")
-
-        data = "grant_type=client_credentials&scope=creatorsapi/default"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": f"Basic {basic}",
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": CREATORS_CREDENTIAL_ID,
+            "client_secret": CREATORS_CREDENTIAL_SECRET,
+            "scope": "creatorsapi::default",
         }
+        headers = {"Content-Type": "application/json"}
 
         if DEBUG_AMAZON:
             print(f"[DEBUG] Token refresh -> {token_url}")
 
-        r = requests.post(token_url, headers=headers, data=data, timeout=20)
+        r = requests.post(token_url, headers=headers, json=data, timeout=20)
         if r.status_code != 200:
-            raise RuntimeError(f"Token error {r.status_code}: {r.text}")
+            raise RuntimeError(f"Token Amazon: HTTP {r.status_code}; controlla credenziali e versione")
 
         j = r.json()
         _access_token = j.get("access_token")
+        if not _access_token:
+            raise RuntimeError("Amazon non ha restituito un access token")
         expires_in = int(j.get("expires_in", 3600) or 3600)
         _token_expiry_epoch = time.time() + expires_in
 
@@ -333,9 +337,9 @@ def _get_access_token():
 
 
 def _auth_header():
-    # Da guida: Authorization: Bearer <token>, Version <version>
+    # Autenticazione Login with Amazon.
     token = _get_access_token()
-    return f"Bearer {token}, Version {CREATORS_CREDENTIAL_VERSION}"
+    return f"Bearer {token}"
 
 
 def _creators_post(path, payload):
@@ -539,12 +543,6 @@ def extract_from_item(item: dict):
             if sv is not None:
                 old_val = price_val + sv
 
-    # ✅ filtro premium: risparmio minimo in euro
-        if price_val is not None and old_val is not None and old_val > price_val:
-            saving_eur = old_val - price_val
-            if saving_eur < MIN_SAVING_EUR:
-                return None  # oppure: continue (dipende dalla tua funzione)
-
     # URL fallback
     if not url and asin:
         url = f"https://www.amazon.it/dp/{asin}?tag={AMAZON_ASSOCIATE_TAG}"
@@ -613,6 +611,9 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 reasons["price_out_range"] += 1
                 continue
 
+            if old_val - price_val < MIN_SAVING_EUR:
+                continue
+
             if disc < MIN_DISCOUNT:
                 reasons["disc_too_low"] += 1
                 continue
@@ -633,14 +634,16 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 "discount": disc,
                 "url_img": url_img,
                 "url": parsed["url"],
-                "minimo": disc >= 30,
+                "minimo": False,
             }
 
     # Fallback getItems su pochi candidati (molto spesso qui arrivano old/savings meglio)
     if asin_candidates:
         try:
             j, used_res = creators_get_items(asin_candidates)
-            items = safe_get(j, "items", default=[]) or []
+            items = safe_get(j, "itemsResult", "items", default=None)
+            if items is None:
+                items = j.get("items", []) or []
             if DEBUG_AMAZON:
                 print(f"[DEBUG] GetItems fallback asins={asin_candidates} items={len(items)} used_resources={used_res}")
 
@@ -657,6 +660,8 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                 if price_val is None or disc == 0:
                     continue
                 if price_val < MIN_PRICE or price_val > MAX_PRICE:
+                    continue
+                if old_val - price_val < MIN_SAVING_EUR:
                     continue
                 if disc < MIN_DISCOUNT:
                     continue
@@ -677,7 +682,7 @@ def _first_valid_item_for_keyword(kw, pubblicati):
                     "discount": disc,
                     "url_img": url_img,
                     "url": parsed["url"],
-                    "minimo": disc >= 30,
+                    "minimo": False,
                 }
 
         except Exception as e:
@@ -705,6 +710,20 @@ def invia_offerta():
         print(f"⚠️ Nessuna offerta valida trovata per keyword: {kw}")
         return False
 
+    with publication_lock:
+        if not can_post(payload["asin"]):
+            return False
+        send_payload(payload, TELEGRAM_CHAT_ID)
+        save_pubblicati(payload["asin"])
+        mark_posted(payload["asin"])
+    print(f"✅ Pubblicata: {payload['asin']} | {kw}")
+    return True
+
+
+publication_lock = threading.Lock()
+
+
+def send_payload(payload, chat_id, reply_markup=None):
     titolo = payload["title"]
     prezzo_nuovo_val = payload["price_new"]
     prezzo_vecchio_val = payload["price_old"]
@@ -738,37 +757,36 @@ def invia_offerta():
     else:
         caption_parts.append(f"💶 A soli <b>{prezzo_nuovo_val:.2f}€</b>")
 
+    if payload.get("note"):
+        caption_parts.append(html.escape(payload["note"]))
+    if payload.get("coupon"):
+        caption_parts.append("🎟 Coupon: " + html.escape(payload["coupon"]) + " (da applicare su Amazon)")
     caption_parts.append(f'👉 <a href="{safe_url}">Acquista ora</a>')
 
     caption = "\n\n".join(caption_parts)
 
     button = InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Acquista ora", url=url)]])
 
-    bot.send_photo(
-        chat_id=TELEGRAM_CHAT_ID,
+    result = bot.send_photo(
+        chat_id=chat_id,
         photo=immagine,
         caption=caption,
         parse_mode="HTML",
-        reply_markup=button,
+        reply_markup=reply_markup or button,
     )
 
-    save_pubblicati(asin)
-    mark_posted(asin)
-    print(f"✅ Pubblicata: {asin} | {kw}")
-    return True
+    return result
 
 
 # ============================================================
 # Fascia oraria Italia (semplice CET/CEST)
 # ============================================================
 def is_in_italy_window(now_utc=None):
-    if now_utc is None:
-        now_utc = datetime.utcnow()
-    month = now_utc.month
-    offset_hours = 2 if 4 <= month <= 10 else 1  # CEST approx / CET approx
-    italy_time = now_utc + timedelta(hours=offset_hours)
-    in_window = 9 <= italy_time.hour < 21
-    return in_window, italy_time
+    now_utc = now_utc or datetime.now(timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    italy_time = now_utc.astimezone(ZoneInfo("Europe/Rome"))
+    return 9 <= italy_time.hour < 21, italy_time
 
 
 def run_if_in_fascia_oraria():
@@ -783,11 +801,14 @@ def run_if_in_fascia_oraria():
 def start_scheduler():
     schedule.clear()
     # Reset pubblicati ogni lunedì (ATTENZIONE: schedule usa timezone della macchina, spesso UTC su Render)
-    schedule.every().monday.at("06:59").do(resetta_pubblicati)
+    schedule.every().monday.at("08:59", "Europe/Rome").do(resetta_pubblicati)
     schedule.every(14).minutes.do(run_if_in_fascia_oraria)
 
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as exc:
+            print(f"Errore scheduler: {type(exc).__name__}")
         time.sleep(5)
 
 

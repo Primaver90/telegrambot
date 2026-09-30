@@ -1,81 +1,69 @@
-from flask import Flask
+"""Avvia un solo scheduler e ricevitore Telegram per container Render."""
+import fcntl
 import os
 import threading
-import traceback
+from flask import Flask
 
 app = Flask(__name__)
 
-_main = None
-_import_trace = None
-_scheduler_started = False
+def check_amazon():
+    """Verifica di sola lettura: non pubblica e non cambia la rotazione keyword."""
+    try:
+        import main
+        data, _ = main.creators_search_items("Apple", 1)
+        items = main.safe_get(data, "searchResult", "items", default=None)
+        if items is None:
+            items = data.get("items", []) or []
+        print(f"Verifica Amazon LwA OK: {len(items)} prodotti ricevuti", flush=True)
+    except Exception as exc:
+        # Non mostra credenziali o contenuti delle risposte API.
+        print(f"Verifica Amazon non riuscita: {type(exc).__name__}. Controllare credenziali/accesso API.", flush=True)
+
+_lock_file = None
+_startup_ok = False
 
 
-def _load_main():
-    """Importa main e salva eventuale traceback completo (utile su Render)."""
-    global _main, _import_trace
-    if _main is not None or _import_trace is not None:
+def start_services():
+    global _lock_file, _startup_ok
+    if os.environ.get('BOT_DISABLE_BACKGROUND') == '1':
         return
     try:
-        import main as m
-        _main = m
-    except Exception:
-        _import_trace = traceback.format_exc()
+        import main
+        main._require_env()
+        main._build_token_url()
+        _lock_file = open('/tmp/telegrambot-services.lock', 'a')
+        try:
+            fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Il lock viene liberato dal sistema alla morte del processo.
+            _lock_file.close()
+            _lock_file = None
+            _startup_ok = True
+            return
+        from manual_offers import run_polling
+        threading.Thread(target=main.start_scheduler, daemon=True).start()
+        threading.Thread(target=run_polling, daemon=True).start()
+        threading.Thread(target=check_amazon, daemon=True).start()
+        print("Bot aggiornato: LwA e comandi privati avviati", flush=True)
+        _startup_ok = True
+    except Exception as exc:
+        print(f'Avvio bot fallito: {type(exc).__name__}. Controlla le variabili di ambiente.')
 
 
-def _start_scheduler_once():
-    """Evita doppio avvio in caso di più import/worker usando un lock file su /tmp."""
-    global _scheduler_started
-    if _scheduler_started:
-        return
-
-    _load_main()
-    if _main is None:
-        return  # se main non importa, non avvio nulla
-
-    lock_path = "/tmp/scheduler.lock"
-    try:
-        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        os.close(fd)
-    except FileExistsError:
-        # già avviato in questo container
-        _scheduler_started = True
-        return
-
-    t = threading.Thread(target=_main.start_scheduler, daemon=True)
-    t.start()
-    _scheduler_started = True
+start_services()
 
 
-# Avvio scheduler in background (una sola volta)
-_start_scheduler_once()
-
-
-@app.get("/health")
+@app.get('/')
+@app.get('/health')
 def health():
-    forwarding_info = ""
-    if _import_trace:
-        # Mostra solo un pezzo per non sparare 200KB in risposta
-        tail = _import_trace[-2000:]
-        forwarding_info = f"\n\nIMPORT_ERROR(main.py):\n{tail}"
-    return "OK" + forwarding_info, 200
+    return ('OK', 200) if _startup_ok else ('Bot non avviato: verifica configurazione', 503)
 
 
-@app.get("/run")
+@app.get('/run')
 def run_now():
-    _load_main()
-    if _main is None:
-        tail = (_import_trace or "Errore sconosciuto")[-2000:]
-        return f"❌ main.py non importabile.\n\n{tail}", 500
-
-    try:
-        ok = _main.invia_offerta()
-        if ok:
-            return "✅ Offerta pubblicata davvero", 200
-        return "⚠️ Nessuna offerta valida trovata (filtri/duplicati o prezzi non disponibili). Riprova tra poco.", 200
-    except Exception:
-        return f"❌ Errore runtime:\n\n{traceback.format_exc()[-2000:]}", 500
+    # Il vecchio endpoint pubblico pubblicava senza autenticazione.
+    return 'Usa la chat privata del bot per preparare e confermare un’offerta.', 403
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '10000')))
